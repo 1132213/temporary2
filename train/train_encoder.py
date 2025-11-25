@@ -17,6 +17,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR # 推荐换用 OneCycleLR，收敛更稳
 import argparse
 from tqdm import tqdm
+import logging
+from datetime import datetime
 
 class FixedPositionalEncoding(nn.Module):
     """标准的正弦位置编码 (不可学习)"""
@@ -153,12 +155,23 @@ def collate_fn_ts_only(batch):
     return series
 
 def train_encoder(args):
+    # --- 日志设置 ---
+    script_dir = Path(__file__).parent
+    log_filename = script_dir / f"encoder_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.FileHandler(log_filename, encoding='utf-8'), logging.StreamHandler()]
+    )
+    logger = logging.getLogger(__name__)
+    logger.info(f"日志文件保存在: {log_filename}")
+    
     device = torch.device(args.device)
-    print(f">>> Using Device: {device}")
+    logger.info(f">>> Using Device: {device}")
     
     # 从模型路径动态获取embed_dim
     llm_embed_dim = get_llm_embed_dim(args.llm_model_path)
-    print(f">>> LLM Embedding Dimension: {llm_embed_dim} (from {args.llm_model_path})")
+    logger.info(f">>> LLM Embedding Dimension: {llm_embed_dim} (from {args.llm_model_path})")
     
     config = CROMEConfig(
         input_channels=args.input_channels,
@@ -168,11 +181,11 @@ def train_encoder(args):
         epsilon=1e-5
     )
     
-    print(">>> Stage 1: Initializing Pre-training (Fixed Sinusoidal PE)...")
+    logger.info(">>> Stage 1: Initializing Pre-training (Fixed Sinusoidal PE)...")
     model = PatchTSTForMaskedPretraining(config).to(device)
     
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f">>> Model Params: {params / 1e6:.2f} M")
+    logger.info(f">>> Model Params: {params / 1e6:.2f} M")
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
     
@@ -195,7 +208,7 @@ def train_encoder(args):
         pct_start=0.1
     )
     
-    print(f">>> Start Training for {args.epochs} epochs...")
+    logger.info(f">>> Start Training for {args.epochs} epochs...")
     model.train()
     best_loss = float('inf')
     
@@ -221,14 +234,14 @@ def train_encoder(args):
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
         
         avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
+        logger.info(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
             # --- 修复 2: 保存完整模型状态 (包含 Head!) ---
             # 使用 state_dict 保存所有参数，这样可视化时 Head 也是训练好的
             torch.save(model.state_dict(), best_save_path)
-            print(f">>> [New Best] Saved to {best_save_path}")
+            logger.info(f">>> [New Best] Saved to {best_save_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
