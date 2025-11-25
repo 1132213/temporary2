@@ -18,45 +18,62 @@ def generate_response(model, series, prefix, device, max_new_tokens=128):
     执行推理生成
     """
     tokenizer = model.tokenizer.tokenizer
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # --- 修复 1: 确保 Pad Token ID 有效 ---
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        tokenizer.pad_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 0
         
-    # 1. 准备 Prompt
-    prefix_inputs = tokenizer(prefix, return_tensors="pt", add_special_tokens=False).to(device)
+    # --- 修复 2: Prefix 开头也要加 BOS (add_special_tokens=True) ---
+    # 这是为了对齐训练时 Input Prefix 的格式
+    prefix_inputs = tokenizer(prefix, return_tensors="pt", add_special_tokens=True).to(device)
     prefix_embeds = model.llm.embed(prefix_inputs.input_ids)
     
-    # 2. 空 Suffix (让模型接着续写)
     empty_suffix = torch.empty(
         series.size(0), 0, model.config.llm_embed_dim, 
         device=device, dtype=prefix_embeds.dtype
     )
     
     with torch.no_grad():
-        # 3. 获取对齐后的特征 (TS -> LLM Embeds)
+        # 获取时序特征
         ts_out = model.ts_model(series, prefix_embeds, empty_suffix)
         inputs_embeds = ts_out["assembled"] 
         
-        # 4. 构造 Attention Mask
+        # ==================【关键修复】==================
+        # 手动拼接 BOS Token Embedding 到 inputs_embeds 末尾
+        # 这一步模拟了训练数据中 Suffix 开头的 <s> Token，
+        # 只有加上它，模型才知道“现在开始根据上下文预测 Word1”
+        # ===============================================
+        bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
+        bos_tensor = torch.tensor([[bos_token_id]], device=device)
+        bos_embeds = model.llm.embed(bos_tensor)
+        
+        # 如果 Batch > 1，需要扩展维度
+        if inputs_embeds.size(0) > 1:
+            bos_embeds = bos_embeds.expand(inputs_embeds.size(0), -1, -1)
+            
+        # 拼接到序列末尾：[Prefix, Stat, TS] + [BOS]
+        inputs_embeds = torch.cat([inputs_embeds, bos_embeds], dim=1)
+        # ===============================================
+
+        # 构造 Attention Mask (全1)
         attention_mask = torch.ones(
             inputs_embeds.shape[:2], 
             dtype=torch.long, 
             device=device
         )
         
-        # 5. 生成
         output_ids = model.llm.model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            do_sample=True,      # 采样模式，生成的描述更自然
-            temperature=0.7,     # 控制多样性
+            do_sample=True,      
+            temperature=0.7,     
             top_p=0.9,
             repetition_penalty=1.1
         )
         
-    # 6. 解码
     generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     return generated_text
 

@@ -1,9 +1,16 @@
 import sys
 from pathlib import Path
-project_root = Path(__file__).resolve().parent.parent
 
-if str(project_root) not in sys.path:
-    sys.path.append(str(project_root))
+# 路径设置：确保能找到 src 和 test 包
+project_root = Path(__file__).resolve().parent.parent
+project_root_str = str(project_root)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
+
+# 引入项目模块
+from src.crome_ts.model import CROMEConfig, StatBypassCROMETS1, get_llm_embed_dim
+from src.crome_ts.data_instruct import JSONLInstructDataset, instruct_collate_fn
+from test.common import set_seed
 import argparse
 import torch
 from torch.utils.data import DataLoader
@@ -12,11 +19,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 import logging
 from datetime import datetime
-
-# 引入项目模块
-from src.crome_ts.model import CROMEConfig, StatBypassCROMETS1, get_llm_embed_dim
-from src.crome_ts.data_instruct import JSONLInstructDataset, instruct_collate_fn
-from test.common import set_seed
 
 def compute_loss(model, series, prefixes, suffixes, device):
     """
@@ -74,7 +76,10 @@ def train(args):
     logger.info(f"日志文件保存在: {log_filename}")
     
     set_seed(args.seed)
-    device = torch.device(args.device)
+    device_str = args.device
+    if args.device.startswith("cuda") and args.gpu_id is not None and ":" not in args.device:
+        device_str = f"cuda:{args.gpu_id}"
+    device = torch.device(device_str)
 
     # 1. 初始化配置
     # 注意：Stage 3 可以选择解冻 Encoder (freeze_patch_encoder=False) 进行微调，
@@ -89,7 +94,7 @@ def train(args):
         patch_len=args.patch_len,
         patch_stride=args.patch_stride,
         llm_model_path=args.llm_model_path,
-        llm_device_map=args.device,
+        llm_device_map=device_str,
         llm_dtype="bfloat16",
         freeze_patch_encoder=args.freeze_encoder, # <--- 通过参数控制
         use_stats_projector=True
@@ -149,7 +154,10 @@ def train(args):
             optimizer.step()
             
             train_loss_sum += loss.item()
-            progress.set_postfix(loss=loss.item())
+            # 获取当前学习率
+            current_lr = optimizer.param_groups[0]['lr']
+            # 在进度条中同时显示 Loss 和 LR
+            progress.set_postfix(loss=loss.item(), lr=f"{current_lr:.2e}")
             
         scheduler.step()
         avg_train_loss = train_loss_sum / len(train_loader)
@@ -184,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--gpu-id", type=int, default=None, help="指定使用的GPU卡号（例如：0, 1, 2等）")
     
     args = parser.parse_args()
     train(args)
