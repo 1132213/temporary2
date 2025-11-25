@@ -1,0 +1,27 @@
+# 模型文件
+*.pth
+
+# 备份文件
+*.bak
+
+# JSON Lines 文件
+*.jsonl
+
+# 日志文件
+*.log
+
+# PDF 文件
+*.pdf
+
+# 文本文件
+*.txt
+
+# 可视化结果文件夹
+vis_results/
+
+# Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
