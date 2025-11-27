@@ -157,7 +157,15 @@ def collate_fn_ts_only(batch):
 def train_encoder(args):
     # --- 日志设置 ---
     script_dir = Path(__file__).parent
-    log_filename = script_dir / f"encoder_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    project_root = script_dir.parent
+    
+    # 创建log和model文件夹
+    log_dir = project_root / "log"
+    model_dir = project_root / "model"
+    log_dir.mkdir(exist_ok=True)
+    model_dir.mkdir(exist_ok=True)
+    
+    log_filename = log_dir / f"encoder_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -212,8 +220,8 @@ def train_encoder(args):
     model.train()
     best_loss = float('inf')
     
-    # --- 修复 1: 提前定义保存路径 ---
-    best_save_path = "patchtst_pretrained_full_3b.pth"
+    # 权重保存路径（使用之前定义的model_dir）
+    best_save_path = model_dir / "patchtst_pretrained_full.pth"
     
     for epoch in range(args.epochs):
         total_loss = 0

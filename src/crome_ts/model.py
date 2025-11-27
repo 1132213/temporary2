@@ -130,11 +130,18 @@ class InputPreprocessor(nn.Module):
         b, l, c = x.shape
         x_norm, stats = self.revin(x)
         
+        # 根据实际输入的通道数动态生成位置编码
+        # 如果输入通道数与配置不同（多通道模式下的单通道输入），创建临时编码器
+        if c != self.config.input_channels:
+            pos_encoding = FixedSinePositionalEncoding(c)
+        else:
+            pos_encoding = self.pos_encoding
+        
         # 生成固定正弦位置编码
-        time_emb = self.pos_encoding(l, device=x.device, dtype=x.dtype)  # [L, C]
+        time_emb = pos_encoding(l, device=x.device, dtype=x.dtype)  # [L, c]
         
         # 扩展 Batch 维度
-        time_emb = time_emb.unsqueeze(0).expand(b, -1, -1)
+        time_emb = time_emb.unsqueeze(0).expand(b, -1, -1)  # [B, L, c]
         
         if self.fuse_mode == "add":
             fused = x_norm + time_emb
@@ -382,13 +389,43 @@ class CROMETSModel(nn.Module):
         self.stat_projector = StatProjector(config)
         self.llm_proj = nn.Linear(config.patch_embedding_dim, config.llm_embed_dim)
 
+    def _process_single_channel(
+        self,
+        channel_data: Tensor,  # [B, L, 1]
+        instruction_embeds: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        处理单个通道，返回 stat_token 和 ts_tokens。
+        
+        Args:
+            channel_data: 单个通道的时间序列数据 [B, L, 1]
+            instruction_embeds: 可选的指令嵌入
+            
+        Returns:
+            stat_token: 统计量token [B, 1, D]
+            ts_tokens: 时序tokens [B, N, D] (N = query_tokens + detail_tokens)
+        """
+        x, stats = self.preprocessor(channel_data)
+        patch_tokens = self.shape_encoder(x)
+        query_tokens = self.qformer(patch_tokens, instruction_embeds)
+        detail_tokens = self.detail_proj(patch_tokens)
+        ts_tokens = self.adapter(query_tokens, detail_tokens)
+        ts_tokens = self.llm_proj(ts_tokens)
+        stat_token = self.stat_projector(stats)
+        return stat_token, ts_tokens
+
     def forward(
         self,
-        raw_series: Tensor,
+        raw_series: Tensor,  # [B, L, C] 其中C是通道数
         text_prefix: Tensor,
         text_suffix: Tensor,
         instruction_embeds: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
+        b, l, c = raw_series.shape
+        
+        # ✨【修复】混合精度训练的关键：强制数据类型对齐
+        target_dtype = text_prefix.dtype
+        
         x, stats = self.preprocessor(raw_series)
         patch_tokens = self.shape_encoder(x)
         query_tokens = self.qformer(patch_tokens, instruction_embeds)
@@ -397,9 +434,7 @@ class CROMETSModel(nn.Module):
         ts_tokens = self.llm_proj(ts_tokens)
         stat_token = self.stat_projector(stats)
         
-        # ✨【修复】混合精度训练的关键：强制数据类型对齐
-        # 防止 torch.cat 将 bfloat16 提升为 float32，导致 LLM 报错
-        target_dtype = text_prefix.dtype
+        # 数据类型对齐
         if ts_tokens.dtype != target_dtype:
             ts_tokens = ts_tokens.to(dtype=target_dtype)
         if stat_token.dtype != target_dtype:
@@ -419,6 +454,7 @@ class CROMETSModel(nn.Module):
 class StatBypassCROMETS1(nn.Module):
     """
     端到端系统封装：形态流 + 量级流 + 指令流 + 冻结 LLM。
+    支持 ChatTS 格式：将多个时间序列插入到文本的 <ts><ts/> 标记位置。
     """
 
     def __init__(self, config: CROMEConfig):
@@ -427,6 +463,11 @@ class StatBypassCROMETS1(nn.Module):
         self.ts_model = CROMETSModel(config)
         self.llm = FrozenLLM(config)
         self.tokenizer = InstructionTokenizer(config)
+        
+        # SEP token（用于分隔多个时间序列）
+        self.sep_token = nn.Parameter(
+            torch.randn(1, config.llm_embed_dim) * 0.02
+        )
 
     def _prepare_text(
         self,
@@ -444,6 +485,177 @@ class StatBypassCROMETS1(nn.Module):
         encoded = self.tokenizer(text_input, device)
         embeds = self.llm.embed(encoded["input_ids"])
         return embeds, encoded["attention_mask"]
+    
+    def forward_chatts(
+        self,
+        input_texts: Sequence[str],  # 包含 <ts><ts/> 标记的文本列表
+        timeseries_lists: Sequence[Sequence[Tensor]],  # 每个样本的时间序列列表
+        output_texts: Sequence[str],  # 输出文本列表
+        llm_kwargs: Optional[Dict] = None,
+    ) -> Dict[str, Tensor]:
+        """
+        处理 ChatTS 格式的输入。
+        
+        将 input_texts 中的 <ts><ts/> 标记替换为对应的时间序列 embeddings。
+        每个时间序列被处理为：[Stat_i][Q_Tokens_i][Detail_Tokens_i][SEP]
+        
+        Args:
+            input_texts: 包含 <ts><ts/> 标记的输入文本列表
+            timeseries_lists: 每个样本对应的时间序列列表，每个时间序列为 [T, C] 的 Tensor
+            output_texts: 输出文本列表
+            llm_kwargs: 传递给 LLM 的额外参数
+            
+        Returns:
+            包含模型输出的字典
+        """
+        device = next(self.parameters()).device
+        llm_kwargs = llm_kwargs or {}
+        batch_size = len(input_texts)
+        
+        # 用于存储每个样本的最终嵌入和mask
+        assembled_embeds_list = []
+        attention_masks_list = []
+        prefix_mask_lengths = []
+        suffix_mask_lengths = []
+        
+        # 处理每个样本
+        for i in range(batch_size):
+            input_text = input_texts[i]
+            timeseries_list = timeseries_lists[i]
+            output_text = output_texts[i]
+            
+            # 分割输入文本：找到所有 <ts><ts/> 标记并分割
+            ts_marker = "<ts><ts/>"
+            text_parts = input_text.split(ts_marker)
+            
+            # 确保时间序列数量与标记数量匹配
+            num_markers = len(text_parts) - 1
+            num_timeseries = len(timeseries_list)
+            
+            if num_timeseries < num_markers:
+                # 如果时间序列不够，用零填充
+                for _ in range(num_markers - num_timeseries):
+                    timeseries_list.append(
+                        torch.zeros(self.config.input_channels, device=device)
+                    )
+            elif num_timeseries > num_markers:
+                # 如果时间序列太多，只使用前 num_markers 个
+                timeseries_list = timeseries_list[:num_markers]
+            
+            # 收集所有片段的嵌入
+            segment_embeds = []
+            segment_masks = []
+            
+            # 确定目标 dtype（从 LLM 的配置获取）
+            # 使用 bfloat16 或模型的实际 dtype
+            target_dtype = next(self.llm.parameters()).dtype
+            
+            # 处理第一个文本片段（prefix）
+            if text_parts[0]:
+                prefix_encoded = self.tokenizer([text_parts[0]], device)
+                prefix_embed = self.llm.embed(prefix_encoded["input_ids"])  # [1, L, D]
+                prefix_mask = prefix_encoded["attention_mask"]  # [1, L]
+                segment_embeds.append(prefix_embed[0])  # [L, D]
+                segment_masks.append(prefix_mask[0])  # [L]
+                prefix_length = prefix_mask[0].sum().item()
+            else:
+                prefix_length = 0
+            
+            prefix_mask_lengths.append(prefix_length)
+            
+            # 处理每个时间序列和后续文本片段
+            for ts_idx, ts_tensor in enumerate(timeseries_list):
+                # 确保时间序列在正确的设备上
+                ts_tensor = ts_tensor.to(device)
+                
+                # 添加 batch 维度：[T, C] -> [1, T, C]
+                ts_batch = ts_tensor.unsqueeze(0)
+                
+                # 生成时间序列的嵌入
+                # 使用 _process_single_channel 方法
+                stat_token, ts_tokens = self.ts_model._process_single_channel(
+                    ts_batch, instruction_embeds=None
+                )
+                # stat_token: [1, 1, D], ts_tokens: [1, N, D]
+                
+                # 确保数据类型对齐
+                if stat_token.dtype != target_dtype:
+                    stat_token = stat_token.to(dtype=target_dtype)
+                if ts_tokens.dtype != target_dtype:
+                    ts_tokens = ts_tokens.to(dtype=target_dtype)
+                
+                # 组装：[Stat][Q_Tokens][Detail_Tokens]
+                ts_embed = torch.cat([stat_token[0], ts_tokens[0]], dim=0)  # [1+N, D]
+                
+                # 添加到片段列表
+                segment_embeds.append(ts_embed)
+                segment_masks.append(torch.ones(ts_embed.shape[0], device=device, dtype=torch.long))
+                
+                # 添加 SEP token（如果不是最后一个时间序列）
+                if ts_idx < len(timeseries_list) - 1:
+                    sep_embed = self.sep_token  # [1, D]
+                    # 确保 dtype 对齐
+                    if sep_embed.dtype != target_dtype:
+                        sep_embed = sep_embed.to(dtype=target_dtype)
+                    # 保持 2D 形状 [1, D]，与其他 embeddings 的形状一致
+                    segment_embeds.append(sep_embed)  # [1, D]
+                    segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
+                
+                # 处理该时间序列后的文本片段
+                text_idx = ts_idx + 1
+                if text_idx < len(text_parts) and text_parts[text_idx]:
+                    text_encoded = self.tokenizer([text_parts[text_idx]], device)
+                    text_embed = self.llm.embed(text_encoded["input_ids"])  # [1, L, D]
+                    text_mask = text_encoded["attention_mask"]  # [1, L]
+                    segment_embeds.append(text_embed[0])  # [L, D]
+                    segment_masks.append(text_mask[0])  # [L]
+            
+            # 处理输出文本（suffix）
+            if output_text:
+                suffix_encoded = self.tokenizer([output_text], device)
+                suffix_embed = self.llm.embed(suffix_encoded["input_ids"])  # [1, L, D]
+                suffix_mask = suffix_encoded["attention_mask"]  # [1, L]
+                segment_embeds.append(suffix_embed[0])  # [L, D]
+                segment_masks.append(suffix_mask[0])  # [L]
+                suffix_length = suffix_mask[0].sum().item()
+            else:
+                suffix_length = 0
+            
+            suffix_mask_lengths.append(suffix_length)
+            
+            # 合并所有片段
+            full_embed = torch.cat(segment_embeds, dim=0)  # [Total_L, D]
+            full_mask = torch.cat(segment_masks, dim=0)  # [Total_L]
+            
+            assembled_embeds_list.append(full_embed)
+            attention_masks_list.append(full_mask)
+        
+        # 对齐批次（padding）
+        max_len = max(emb.shape[0] for emb in assembled_embeds_list)
+        embed_dim = assembled_embeds_list[0].shape[1]
+        
+        padded_embeds = torch.zeros(batch_size, max_len, embed_dim, device=device, dtype=assembled_embeds_list[0].dtype)
+        padded_masks = torch.zeros(batch_size, max_len, device=device, dtype=torch.long)
+        
+        for i, (emb, mask) in enumerate(zip(assembled_embeds_list, attention_masks_list)):
+            seq_len = emb.shape[0]
+            padded_embeds[i, :seq_len] = emb
+            padded_masks[i, :seq_len] = mask
+        
+        # 通过 LLM
+        outputs = self.llm(
+            inputs_embeds=padded_embeds,
+            attention_mask=padded_masks,
+            **llm_kwargs,
+        )
+        
+        return {
+            "assembled": padded_embeds,
+            "attention_mask": padded_masks,
+            "llm_outputs": outputs,
+            "prefix_mask_lengths": prefix_mask_lengths,
+            "suffix_mask_lengths": suffix_mask_lengths,
+        }
 
     def forward(
         self,
@@ -469,6 +681,7 @@ class StatBypassCROMETS1(nn.Module):
             instruction_embeds=instruction_embeds,
         )
         batch = raw_series.size(0)
+        
         stat_tokens = ts_outputs["stat_token"]
         ts_tokens = ts_outputs["ts_tokens"]
         ones = torch.ones(
@@ -487,6 +700,7 @@ class StatBypassCROMETS1(nn.Module):
             [prefix_mask, ones, ts_mask, suffix_mask],
             dim=1,
         )
+        
         outputs = self.llm(
             inputs_embeds=ts_outputs["assembled"],
             attention_mask=attention_mask,

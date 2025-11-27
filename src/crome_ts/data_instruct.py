@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Dataset
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import json
 import numpy as np
 
@@ -148,7 +148,13 @@ class TimeMMDInstructDataset(Dataset):
 def _record_to_array(record: Dict[str, Any], record_idx: int) -> np.ndarray:
     """
     将 JSONL 记录中的时序数据解析为二维 numpy 数组。
-    现在要求数据直接以内联字段 `input_ts` / `ts_data` 形式提供。
+    输入数据应该是 [T, C] 格式（时间步在外层，通道在内层）。
+    
+    输出格式为 [时间步, 通道]，即 [T, C]
+    
+    Args:
+        record: JSON记录
+        record_idx: 记录索引（用于错误提示）
     """
     ts_data = record.get("input_ts")
     if ts_data is None:
@@ -158,11 +164,20 @@ def _record_to_array(record: Dict[str, Any], record_idx: int) -> np.ndarray:
             f"Record {record_idx} 缺少内联时序字段 `input_ts`，"
             "请先将遗留的 `*_ts_path` 数据迁移为嵌入式 JSON。"
         )
+    
     array = np.asarray(ts_data, dtype=np.float32)
-    if array.ndim == 1:
+    
+    # 处理不同维度的数据
+    if array.ndim == 2:
+        # 已经是 [T, C] 格式，保持原样
+        pass
+    elif array.ndim == 1:
+        # 单通道数据，转换为 [T, 1]
         array = array.reshape(-1, 1)
     elif array.ndim > 2:
+        # 多维数组，展平
         array = array.reshape(array.shape[0], -1)
+    
     return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -170,17 +185,18 @@ class JSONLInstructDataset(Dataset):
     """
     JSONL 格式的指令微调数据集
     支持从 JSONL 文件加载指令、时间序列路径和输出文本。
+    数据格式应为 [T, C]（时间步在外层，通道在内层）。
+    支持自动检测通道数（当input_channels为None时）。
     """
     def __init__(
         self,
         jsonl_path: str,
         seq_len: int,
-        input_channels: int,
+        input_channels: Optional[int] = None,  # 如果为None，将从数据中自动检测
         split: str = "train",
-        split_ratio: float = 0.9
+        split_ratio: float = 0.9,
     ):
         self.seq_len = seq_len
-        self.input_channels = input_channels
         
         jsonl_file = Path(jsonl_path)
         if not jsonl_file.exists():
@@ -198,6 +214,17 @@ class JSONLInstructDataset(Dataset):
         if len(records) == 0:
             raise ValueError(f"JSONL file is empty: {jsonl_file}")
         
+        # 自动检测通道数（如果需要）
+        if input_channels is None:
+            # 从第一个记录中检测通道数
+            first_record = records[0]
+            sample_array = _record_to_array(first_record, 0)
+            detected_channels = sample_array.shape[1]
+            self.input_channels = detected_channels
+            print(f"[{split.upper()}] Auto-detected {detected_channels} channels from data")
+        else:
+            self.input_channels = input_channels
+        
         # 划分训练/验证集
         split_idx = int(len(records) * split_ratio)
         if split == "train":
@@ -205,7 +232,7 @@ class JSONLInstructDataset(Dataset):
         else:
             self.records = records[split_idx:]
         
-        print(f"[{split.upper()}] Loaded {len(self.records)} samples from {jsonl_file.name}")
+        print(f"[{split.upper()}] Loaded {len(self.records)} samples from {jsonl_file.name} (channels: {self.input_channels})")
     
     def __len__(self):
         return len(self.records)
@@ -252,8 +279,133 @@ class JSONLInstructDataset(Dataset):
             "suffix": output_text
         }
 
+class ChatTSDataset(Dataset):
+    """
+    ChatTS 格式的指令微调数据集
+    支持从 JSONL 文件加载包含 <ts><ts/> 标记的文本和多个时间序列。
+    
+    数据格式：
+    {
+        "input": "文本 <ts><ts/> 更多文本 <ts><ts/>",
+        "timeseries": [[...], [...], ...],  # 二维数组，每个元素是一个时间序列
+        "output": "输出文本"
+    }
+    """
+    def __init__(
+        self,
+        jsonl_path: str,
+        seq_len: int,
+        input_channels: Optional[int] = None,
+        split: str = "train",
+        split_ratio: float = 0.9,
+    ):
+        self.seq_len = seq_len
+        
+        jsonl_file = Path(jsonl_path)
+        if not jsonl_file.exists():
+            raise FileNotFoundError(f"JSONL file not found: {jsonl_file}")
+        
+        # 加载 JSONL 文件
+        records = []
+        with jsonl_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        
+        if len(records) == 0:
+            raise ValueError(f"JSONL file is empty: {jsonl_file}")
+        
+        # 自动检测通道数（每个时间序列都是单通道）
+        if input_channels is None:
+            # ChatTS 格式中每个时间序列都是一维的，input_channels 应该是1
+            self.input_channels = 1
+            print(f"[{split.upper()}] Auto-detected {self.input_channels} channel(s) for ChatTS format")
+        else:
+            self.input_channels = input_channels
+        
+        # 划分训练/验证集
+        split_idx = int(len(records) * split_ratio)
+        if split == "train":
+            self.records = records[:split_idx]
+        else:
+            self.records = records[split_idx:]
+        
+        print(f"[{split.upper()}] Loaded {len(self.records)} samples from {jsonl_file.name}")
+    
+    def __len__(self):
+        return len(self.records)
+    
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        
+        # 获取 input 文本和时间序列数据
+        input_text = record.get("input", "").strip()
+        timeseries_list = record.get("timeseries", [])
+        output_text = record.get("output", "").strip()
+        
+        # 处理时间序列数据
+        # timeseries_list 是二维数组，每个元素是一个时间序列
+        processed_series = []
+        for ts_data in timeseries_list:
+            # 将时间序列转换为 numpy 数组
+            array = np.asarray(ts_data, dtype=np.float32)
+            
+            # 确保是一维数组
+            if array.ndim > 1:
+                # 如果是多维，取第一维
+                array = array.flatten()
+            
+            # 处理长度
+            if len(array) > self.seq_len:
+                # 截取最后 seq_len 个时间步
+                array = array[-self.seq_len:]
+            elif len(array) < self.seq_len:
+                # 填充零
+                pad_len = self.seq_len - len(array)
+                array = np.pad(array, (0, pad_len), mode='constant', constant_values=0.0)
+            
+            # 转换为 [T, C] 格式，这里 C=1
+            array = array.reshape(-1, 1)
+            
+            # NaN 处理
+            array = np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # 转换为 tensor
+            ts_tensor = torch.tensor(array, dtype=torch.float32)
+            processed_series.append(ts_tensor)
+        
+        # 如果没有时间序列数据，创建一个零张量
+        if len(processed_series) == 0:
+            processed_series = [torch.zeros(self.seq_len, self.input_channels, dtype=torch.float32)]
+        
+        # 构建返回字典
+        return {
+            "input_text": input_text,  # 包含 <ts><ts/> 标记的原始文本
+            "timeseries_list": processed_series,  # 处理后的时间序列列表
+            "output_text": output_text,  # 输出文本
+        }
+
+
 def instruct_collate_fn(batch):
     series = torch.stack([item["series"] for item in batch])
     prefixes = [item["prefix"] for item in batch]
     suffixes = [item["suffix"] for item in batch]
     return series, prefixes, suffixes
+
+
+def chatts_collate_fn(batch):
+    """
+    ChatTS 格式的 collate 函数
+    处理包含多个时间序列的批次数据
+    """
+    input_texts = [item["input_text"] for item in batch]
+    timeseries_lists = [item["timeseries_list"] for item in batch]
+    output_texts = [item["output_text"] for item in batch]
+    
+    return {
+        "input_texts": input_texts,
+        "timeseries_lists": timeseries_lists,
+        "output_texts": output_texts,
+    }

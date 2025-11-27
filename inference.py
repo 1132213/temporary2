@@ -68,13 +68,27 @@ def main(args):
     
     print(f">>> Loading Model from {args.checkpoint}...")
     
-    # 1. 配置 (需与训练一致)
+    # 1. 先加载数据集以自动检测通道数
+    print(f">>> Loading Dataset to auto-detect channels: {args.jsonl_path}...")
+    # 先创建一个临时数据集来检测通道数
+    temp_ds = JSONLInstructDataset(
+        args.jsonl_path, args.seq_len, 
+        input_channels=getattr(args, 'input_channels', None),  # None表示自动检测
+        split="val"
+    )
+    detected_channels = temp_ds.input_channels
+    print(f">>> Auto-detected input channels: {detected_channels}")
+    
+    # 使用检测到的通道数（如果用户指定了则使用指定的）
+    input_channels = getattr(args, 'input_channels', None) or detected_channels
+    
+    # 2. 配置 (需与训练一致)
     # 从模型路径动态获取embed_dim
     llm_embed_dim = get_llm_embed_dim(args.llm_model_path)
     print(f">>> LLM Embedding Dimension: {llm_embed_dim} (from {args.llm_model_path})")
     
     config = CROMEConfig(
-        input_channels=args.input_channels,
+        input_channels=input_channels,
         llm_embed_dim=llm_embed_dim,
         patch_len=args.patch_len,
         patch_stride=args.patch_stride,
@@ -82,20 +96,23 @@ def main(args):
         llm_device_map=device_str,
         llm_dtype="bfloat16",
         use_stats_projector=True,
-        epsilon=1e-5
+        epsilon=1e-5,
     )
     
-    # 2. 初始化模型
+    # 3. 初始化模型
     model = StatBypassCROMETS1(config).to(device)
     
-    # 3. 加载权重 (Full Weights)
+    # 4. 加载权重 (Full Weights)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint, strict=True) # 全量加载，必须严格匹配
     model.eval()
     print(">>> Model Loaded Successfully.")
     
-    # 4. 加载验证数据
-    val_ds = JSONLInstructDataset(args.jsonl_path, args.seq_len, args.input_channels, split="val")
+    # 5. 正式加载验证数据
+    val_ds = JSONLInstructDataset(
+        args.jsonl_path, args.seq_len, input_channels, 
+        split="val"
+    )
     # batch_size=1 方便观察
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=True, collate_fn=instruct_collate_fn)
     
@@ -132,7 +149,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to crome_instruct_best.pth")
     
     parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--input-channels", type=int, default=1)
+    parser.add_argument("--input-channels", type=int, default=None, help="输入通道数（多通道数据中的通道数）。如果未指定，将从数据中自动检测")
     parser.add_argument("--patch-len", type=int, default=32)
     parser.add_argument("--patch-stride", type=int, default=16)
     parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-3.2-3B")
