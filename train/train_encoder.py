@@ -220,8 +220,12 @@ def train_encoder(args):
     model.train()
     best_loss = float('inf')
     
-    # 权重保存路径（使用之前定义的model_dir）
-    best_save_path = model_dir / "patchtst_pretrained_full.pth"
+    # 权重保存路径（使用之前定义的model_dir，支持自定义后缀）
+    if args.model_suffix:
+        model_filename = f"patchtst_pretrained_full_{args.model_suffix}.pth"
+    else:
+        model_filename = "patchtst_pretrained_full.pth"
+    best_save_path = model_dir / model_filename
     
     for epoch in range(args.epochs):
         total_loss = 0
@@ -265,6 +269,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3) # OneCycleLR 可以给大一点的初始 LR
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--gpu-id", type=str, default=None)
+    parser.add_argument("--model-suffix", type=str, default="", 
+                        help="模型文件名的后缀，例如：1st，则模型名为 patchtst_pretrained_full_1st.pth")
     args = parser.parse_args()
     
     if args.gpu_id: args.device = f"cuda:{args.gpu_id}"

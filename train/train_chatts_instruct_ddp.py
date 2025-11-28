@@ -25,6 +25,16 @@ from datetime import datetime
 import math
 import os
 
+# === 新增：PEFT 库 ===
+try:
+    from peft import get_peft_model, LoraConfig, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+    print("Warning: peft not installed. LoRA will not be available.")
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 def setup_distributed():
     """初始化分布式训练环境"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -56,60 +66,75 @@ def cleanup_distributed():
 
 def compute_chatts_loss(model, batch, device):
     """
-    计算 ChatTS 格式的 Causal LM Loss
+    计算 ChatTS 格式的 Causal LM Loss (修正版：解决 EOS 对齐问题)
     """
     input_texts = batch["input_texts"]
     timeseries_lists = batch["timeseries_lists"]
     output_texts = batch["output_texts"]
     
-    # 使用 forward_chatts 方法 - 需要处理 DDP 包装
+    # 获取 tokenizer
+    if isinstance(model, DDP):
+        tokenizer = model.module.tokenizer.tokenizer
+    else:
+        tokenizer = model.tokenizer.tokenizer
+        
+    # === 核心修正 1: 构造带有 EOS 的文本 ===
+    # 我们不仅要用它生成 Label，还要把它作为 Input 传给模型！
+    # 这样 Input = [BOS, ..., EOS]，Label = [BOS, ..., EOS]
+    # Shift 后：Input [BOS, ...] 预测 Label [..., EOS] -> 完美对齐
+    eos_token = tokenizer.eos_token
+    output_texts_with_eos = [str(text) + eos_token for text in output_texts]
+    
+    # === 核心修正 2: 传给模型的是加了 EOS 的文本 ===
+    # 使用 forward_chatts 方法
     actual_model = model.module if isinstance(model, DDP) else model
     model_out = actual_model.forward_chatts(
         input_texts=input_texts,
         timeseries_lists=timeseries_lists,
-        output_texts=output_texts,
+        output_texts=output_texts_with_eos,  # <--- 注意这里传的是带 EOS 的列表
         llm_kwargs={}
     )
     
     llm_out = model_out["llm_outputs"]
     logits = llm_out.logits  # [B, Total_L, Vocab]
     
-    # 获取输出文本的标签
-    # 注意：在 DDP 模式下，需要访问 module 中的 tokenizer
-    if isinstance(model, DDP):
-        tokenizer = model.module.tokenizer.tokenizer
-    else:
-        tokenizer = model.tokenizer.tokenizer
-    
+    # === 核心修正 3: 生成标签 (保持默认行为，不要手动去掉 special tokens) ===
+    # 让 tokenizer 自己处理 BOS (如果模型配置了的话)，这样跟 input 保持一致
     suffix_labels = tokenizer(
-        output_texts, return_tensors="pt", padding=True
+        output_texts_with_eos, 
+        return_tensors="pt", 
+        padding=True,
+        add_special_tokens=True # 保持默认，与 forward_chatts 内部行为一致
     ).input_ids.to(device)
     
     # 计算输出文本在完整序列中的起始位置
     batch_size = logits.shape[0]
     suffix_mask_lengths = model_out["suffix_mask_lengths"]
     
-    # 计算每个样本的 suffix 起始位置
     losses = []
     for i in range(batch_size):
-        # 获取该样本的有效长度（排除padding）
         valid_len = model_out["attention_mask"][i].sum().item()
         suffix_len = suffix_mask_lengths[i]
         
         if suffix_len == 0:
             continue
         
-        # suffix 的起始位置
         suffix_start = int(valid_len - suffix_len)
         
-        # 提取该样本的 logits 和 labels
-        sample_logits = logits[i, suffix_start:suffix_start+suffix_len, :]  # [suffix_len, Vocab]
-        sample_labels = suffix_labels[i, :suffix_len]  # [suffix_len]
+        # 提取 logits 和 labels
+        # 此时 suffix_len 已经包含了 EOS (以及可能的 BOS)
+        sample_logits = logits[i, suffix_start:suffix_start+suffix_len, :] 
+        sample_labels = suffix_labels[i, :suffix_len]
+        
+        # 双重保险：检查长度是否匹配，防止 padding 导致的微小差异
+        min_len = min(sample_logits.shape[0], sample_labels.shape[0])
+        sample_logits = sample_logits[:min_len]
+        sample_labels = sample_labels[:min_len]
         
         # Causal LM: 预测下一个 token
         if sample_logits.shape[0] > 1:
-            shift_logits = sample_logits[:-1, :]  # [suffix_len-1, Vocab]
-            shift_labels = sample_labels[1:]  # [suffix_len-1]
+            shift_logits = sample_logits[:-1, :] 
+            shift_labels = sample_labels[1:] 
             
             # 计算交叉熵损失
             loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
@@ -147,7 +172,7 @@ def evaluate(model, val_loader, device, rank):
 
 def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
     """
-    多卡分布式训练主函数 - Stage 3 指令微调
+    多卡分布式训练主函数 - Stage 3 指令微调 (支持 LoRA)
     """
     # 设置设备
     device = torch.device(f"cuda:{local_rank}")
@@ -230,16 +255,49 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         if rank == 0 and logger:
             logger.warning(f"!!! Stage 2 checkpoint not found at {stage2_path}! Training from scratch (NOT RECOMMENDED). !!!")
 
-    # 3. 确定可训练参数
+    # ==================== 3. LoRA 配置与注入 (新增) ====================
+    if args.use_lora:
+        if not PEFT_AVAILABLE:
+            raise RuntimeError("PEFT library is not installed. Please install it to use LoRA.")
+        
+        if rank == 0 and logger:
+            logger.info(f">>> Applying LoRA to LLM (r={args.lora_r}, alpha={args.lora_alpha})...")
+        
+        # LoRA 配置
+        # 针对 Llama 模型，通常 target_modules 包括 q_proj, v_proj 等
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM, 
+            inference_mode=False, 
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            # target_modules: 根据具体 LLM 架构调整，这里以 Llama 为例
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        )
+        
+        # 将 LoRA 注入到 model.llm.model 中
+        # 注意：StatBypassCROMETS1 包装了 llm。我们需要直接操作内部的 llm.model
+        model.llm.model = get_peft_model(model.llm.model, peft_config)
+        
+        if rank == 0 and logger:
+            # 打印 LoRA 可训练参数
+            model.llm.model.print_trainable_parameters()
+            logger.info(">>> LoRA applied successfully.")
+
+    # 4. 冻结参数策略
+    # 4.1 Encoder 冻结
     if args.freeze_encoder:
         for p in model.ts_model.shape_encoder.parameters():
             p.requires_grad = False
     
-    # 冻结 LLM
-    for p in model.llm.parameters():
-        p.requires_grad = False
+    # 4.2 LLM 冻结
+    # 如果使用了 LoRA，PEFT 会自动处理 LLM 的冻结（只训练 LoRA 部分）
+    # 如果没用 LoRA，则按原逻辑完全冻结 LLM
+    if not args.use_lora:
+        for p in model.llm.parameters():
+            p.requires_grad = False
     
-    # 4. 使用 DDP 包装模型
+    # 5. 使用 DDP 包装模型
     if world_size > 1:
         model = DDP(
             model, 
@@ -254,7 +312,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
     
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     
-    # 5. 数据加载 - 使用 DistributedSampler
+    # 6. 数据加载 - 使用 DistributedSampler
     if rank == 0 and logger:
         logger.info(f">>> Loading ChatTS Dataset from {args.jsonl_path}...")
     
@@ -281,7 +339,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         train_ds, 
         batch_size=args.batch_size, 
         sampler=train_sampler,
-        shuffle=(train_sampler is None),  # 如果使用 sampler，则不能 shuffle
+        shuffle=(train_sampler is None),
         collate_fn=chatts_collate_fn,
         num_workers=args.num_workers,
         pin_memory=True
@@ -312,7 +370,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         div_factor=25.0
     )
     
-    # 6. 训练循环
+    # 7. 训练循环
     best_val_loss = float("inf")
     accumulation_steps = args.gradient_accumulation_steps
     
@@ -321,55 +379,47 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         logger.info(f">>> Effective Batch Size: {args.batch_size * accumulation_steps * world_size}")
     
     for epoch in range(args.epochs):
-        # 设置 epoch（对于 DistributedSampler 很重要）
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
         model.train()
         train_loss_sum = 0
         
-        # 只在 rank 0 上显示进度条
         if rank == 0:
-            progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [ChatTS-Instruct-DDP]")
+            progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Instruct-LoRA]")
         else:
             progress = train_loader
         
         optimizer.zero_grad()
         
         for step, batch in enumerate(progress):
-            # 计算 loss
             loss = compute_chatts_loss(model, batch, device) / accumulation_steps
             loss.backward()
             
             train_loss_sum += loss.item() * accumulation_steps
             
-            # 梯度累积更新
             if (step + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
             
-            # 只在 rank 0 上更新进度条
             if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 progress.set_postfix(loss=loss.item() * accumulation_steps, lr=f"{current_lr:.2e}")
         
-        # 处理剩余梯度
         if len(train_loader) % accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
         
-        # 同步所有进程的训练损失
         avg_train_loss = train_loss_sum / len(train_loader)
         if dist.is_initialized():
             train_loss_tensor = torch.tensor(avg_train_loss, device=device)
             dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.AVG)
             avg_train_loss = train_loss_tensor.item()
         
-        # Validation
         if rank == 0 and logger:
             logger.info(f"Epoch {epoch+1} [Eval] Computing Validation Loss...")
         avg_val_loss = evaluate(model, val_loader, device, rank)
@@ -382,17 +432,24 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
             if logger:
                 logger.info(f">>> Val Loss Improved ({best_val_loss:.4f} -> {avg_val_loss:.4f}). Saving Model...")
             best_val_loss = avg_val_loss
-            save_path = model_dir / "chatts_instruct_best_ddp.pth"
+            
+            if args.model_suffix:
+                model_filename = f"chatts_instruct_best_ddp_{args.model_suffix}.pth"
+            else:
+                model_filename = "chatts_instruct_best_ddp.pth"
+            save_path = model_dir / model_filename
             
             # 获取实际模型（去除 DDP wrapper）
             model_to_save = model.module if isinstance(model, DDP) else model
             
-            # 保存完整权重（包含所有训练过的部分）
+            # 保存完整权重（包含 Adapter + LoRA），方便加载
+            # 注意：如果只保存 LoRA，需要用 peft 的 save_pretrained
+            # 这里为了简单，直接保存整个 state_dict，虽然文件大点但最稳妥
             torch.save(model_to_save.state_dict(), save_path)
+            
             if logger:
-                logger.info(f">>> Best ChatTS Instruct Model saved to: {save_path}")
+                logger.info(f">>> Best ChatTS Instruct Model (with LoRA) saved to: {save_path}")
         
-        # 同步所有进程（确保所有进程在同一 epoch）
         if dist.is_initialized():
             dist.barrier()
 
@@ -400,7 +457,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         logger.info(">>> ChatTS Instruction Tuning Completed!")
 
 def main():
-    parser = argparse.ArgumentParser(description="ChatTS 格式数据 - Stage 3 多卡指令微调")
+    parser = argparse.ArgumentParser(description="ChatTS 格式数据 - Stage 3 多卡指令微调 (支持 LoRA)")
     parser.add_argument("--jsonl-path", type=str, 
                         default="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/sft/train_cleaned.jsonl",
                         help="ChatTS 格式的 JSONL 数据文件路径")
@@ -419,11 +476,19 @@ def main():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8, 
                         help="梯度累积步数")
     parser.add_argument("--lr", type=float, default=5e-5, 
-                        help="学习率（微调阶段通常比对齐阶段小）") 
+                        help="学习率") 
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader 的工作进程数")
+    parser.add_argument("--model-suffix", type=str, default="", 
+                        help="模型文件名的后缀")
+    
+    # === LoRA 参数 ===
+    parser.add_argument("--use-lora", action="store_true", help="是否使用 LoRA 微调 LLM")
+    parser.add_argument("--lora-r", type=int, default=16, help="LoRA Rank")
+    parser.add_argument("--lora-alpha", type=int, default=32, help="LoRA Alpha")
+    parser.add_argument("--lora-dropout", type=float, default=0.1, help="LoRA Dropout")
     
     args = parser.parse_args()
     
@@ -438,4 +503,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

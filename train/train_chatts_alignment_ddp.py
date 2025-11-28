@@ -60,33 +60,45 @@ def cleanup_distributed():
 
 def compute_chatts_loss(model, batch, device):
     """
-    计算 ChatTS 格式的 Causal LM Loss
+    计算 ChatTS 格式的 Causal LM Loss (修正版：解决 EOS 对齐问题)
     """
     input_texts = batch["input_texts"]
     timeseries_lists = batch["timeseries_lists"]
     output_texts = batch["output_texts"]
     
-    # 使用 forward_chatts 方法 - 需要处理 DDP 包装
+    # 获取 tokenizer
+    # DDP 模式下需要通过 module 访问
+    if isinstance(model, DDP):
+        tokenizer = model.module.tokenizer.tokenizer
+    else:
+        tokenizer = model.tokenizer.tokenizer
+        
+    # === 核心修正 1: 构造带有 EOS 的文本 ===
+    # 确保模型输入和标签都包含 EOS Token，防止“不会闭嘴”和 Loss 对齐错误
+    eos_token = tokenizer.eos_token
+    output_texts_with_eos = [str(text) + eos_token for text in output_texts]
+    
+    # === 核心修正 2: 将带 EOS 的文本传给 Forward ===
     actual_model = model.module if isinstance(model, DDP) else model
     model_out = actual_model.forward_chatts(
         input_texts=input_texts,
         timeseries_lists=timeseries_lists,
-        output_texts=output_texts,
+        output_texts=output_texts_with_eos,  # <--- 使用带 EOS 的文本
         llm_kwargs={}
     )
     
     llm_out = model_out["llm_outputs"]
     logits = llm_out.logits  # [B, Total_L, Vocab]
     
-    # 获取输出文本的标签
-    # 注意：在 DDP 模式下，需要访问 module 中的 tokenizer
-    if isinstance(model, DDP):
-        tokenizer = model.module.tokenizer.tokenizer
-    else:
-        tokenizer = model.tokenizer.tokenizer
-    
+    # === 核心修正 3: 生成标签 (保持默认行为) ===
+    # tokenizer 默认行为 (add_special_tokens=True) 会添加 BOS
+    # 这样 Input = [BOS, ..., EOS], Label = [BOS, ..., EOS]
+    # 错位预测时刚好对齐
     suffix_labels = tokenizer(
-        output_texts, return_tensors="pt", padding=True
+        output_texts_with_eos, 
+        return_tensors="pt", 
+        padding=True,
+        add_special_tokens=True 
     ).input_ids.to(device)
     
     # 计算输出文本在完整序列中的起始位置
@@ -106,9 +118,14 @@ def compute_chatts_loss(model, batch, device):
         # suffix 的起始位置
         suffix_start = int(valid_len - suffix_len)
         
-        # 提取该样本的 logits 和 labels
+        # 提取 logits 和 labels
         sample_logits = logits[i, suffix_start:suffix_start+suffix_len, :]  # [suffix_len, Vocab]
         sample_labels = suffix_labels[i, :suffix_len]  # [suffix_len]
+        
+        # 对齐截断 (防止 tokenizer padding 导致的微小长度差异)
+        min_len = min(sample_logits.shape[0], sample_labels.shape[0])
+        sample_logits = sample_logits[:min_len]
+        sample_labels = sample_labels[:min_len]
         
         # Causal LM: 预测下一个 token
         if sample_logits.shape[0] > 1:
@@ -324,6 +341,7 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         shuffle=(train_sampler is None),  # 如果使用 sampler，则不能 shuffle
         collate_fn=chatts_collate_fn,
         num_workers=args.num_workers,
+        drop_last=True,
         pin_memory=True
     )
     
@@ -334,6 +352,7 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         shuffle=False,
         collate_fn=chatts_collate_fn,
         num_workers=args.num_workers,
+        drop_last=True,
         pin_memory=True
     )
     
@@ -378,7 +397,16 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         
         for step, batch in enumerate(progress):
             # 计算 loss
-            loss = compute_chatts_loss(model, batch, device) / accumulation_steps
+            loss = compute_chatts_loss(model, batch, device)
+            
+            # === DDP 安全的 NaN 处理 ===
+            if torch.isnan(loss) or torch.isinf(loss):
+                if rank == 0:
+                    logger.warning(f"!!! NaN detected at Epoch {epoch+1} Step {step}. Zeroing loss.")
+                loss = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            # 归一化 (Gradient Accumulation)
+            loss = loss / accumulation_steps
             loss.backward()
             
             train_loss_sum += loss.item() * accumulation_steps
@@ -418,7 +446,12 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         # 只在 rank 0 上保存模型
         if rank == 0 and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            save_path = model_dir / "chatts_stage2_aligned_ddp_full.pth"
+            # 根据 model_suffix 参数构建模型文件名
+            if args.model_suffix:
+                model_filename = f"chatts_stage2_aligned_ddp_{args.model_suffix}.pth"
+            else:
+                model_filename = "chatts_stage2_aligned_ddp.pth"
+            save_path = model_dir / model_filename
             
             # 获取实际模型（去除 DDP wrapper）
             model_to_save = model.module if isinstance(model, DDP) else model
@@ -458,6 +491,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader 的工作进程数")
+    parser.add_argument("--model-suffix", type=str, default="", 
+                        help="模型文件名的后缀，例如：1st，则模型名为 chatts_stage2_aligned_ddp_1st.pth")
     
     args = parser.parse_args()
     
@@ -472,4 +507,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

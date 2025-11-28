@@ -76,7 +76,7 @@ class RevIN(nn.Module):
     Reversible Instance Normalization。
     """
 
-    def __init__(self, eps: float = 1e-5):
+    def __init__(self, eps: float = 1e-4):
         super().__init__()
         self.eps = eps
 

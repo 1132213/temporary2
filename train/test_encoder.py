@@ -72,12 +72,15 @@ class PatchTSTForMaskedPretraining(nn.Module):
         ids_shuffle = torch.argsort(noise, dim=1)
         
         mask = torch.zeros(B, N, dtype=torch.bool, device=x.device)
-        mask.scatter_(1, ids_shuffle[:, len_keep:], 1) # 1=Masked
+        # 如果 mask_ratio 为 0，这里 len_keep == N，不会进行 scatter，mask 全为 False
+        if len_keep < N:
+            mask.scatter_(1, ids_shuffle[:, len_keep:], 1) # 1=Masked
         
         # 4. 替换内容 (Masking)
         x_input = patches.clone()
-        mask_expanded = mask.unsqueeze(-1).expand(-1, -1, D)
-        x_input[mask_expanded] = self.mask_token.expand_as(x_input)[mask_expanded]
+        if mask_ratio > 0:
+            mask_expanded = mask.unsqueeze(-1).expand(-1, -1, D)
+            x_input[mask_expanded] = self.mask_token.expand_as(x_input)[mask_expanded]
         
         # 5. 注入位置信息 (Add PE)
         x_final = self.pos_encoding(x_input)
@@ -115,22 +118,21 @@ class PatchTSTForMaskedPretraining(nn.Module):
         recon_series = recon_series / (count_map + 1e-6)
         
         # 只有当 visible_count == 0 时，才是真正的“盲区” (完全没有上下文)
-        # 这种区域模型只能靠纯推理，无法“抄答案”
         real_blind_spot = (visible_count == 0).float()
         
         return x_norm, recon_series, real_blind_spot
 
 # --- 3. 可视化工具函数 ---
-def plot_sample(x_norm, recon, mask_map, save_path, sample_idx):
+def plot_sample(x_norm, recon, mask_map, save_path, title):
     plt.figure(figsize=(12, 6))
     
     time_steps = np.arange(len(x_norm))
     
-    # 绘制灰色背景表示“真正的盲区”
-    # 现在的灰色区域会比之前少，但代表了真正的挑战区
-    plt.fill_between(time_steps, x_norm.min(), x_norm.max(), 
-                     where=(mask_map > 0), 
-                     color='gray', alpha=0.2, label='True Blind Spot')
+    # 绘制灰色背景表示“真正的盲区” (仅当 mask_map 中存在 > 0 的值时)
+    if np.any(mask_map > 0):
+        plt.fill_between(time_steps, x_norm.min(), x_norm.max(), 
+                         where=(mask_map > 0), 
+                         color='gray', alpha=0.2, label='True Blind Spot')
     
     # 绘制真实值
     plt.plot(x_norm, label='Ground Truth', color='blue', linewidth=2, alpha=0.8)
@@ -138,7 +140,7 @@ def plot_sample(x_norm, recon, mask_map, save_path, sample_idx):
     # 绘制重建值
     plt.plot(recon, label='Reconstruction', color='orange', linestyle='--', linewidth=1.5)
     
-    plt.title(f"Reconstruction Sample {sample_idx} (Overlap Corrected)")
+    plt.title(title)
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -151,7 +153,6 @@ def main(args):
     device = torch.device(args.device)
     
     # 1. 配置
-    # 从模型路径动态获取embed_dim
     llm_embed_dim = get_llm_embed_dim(args.llm_model_path)
     print(f">>> LLM Embedding Dimension: {llm_embed_dim} (from {args.llm_model_path})")
     
@@ -169,21 +170,17 @@ def main(args):
     
     checkpoint = torch.load(args.checkpoint, map_location=device)
     
-    # 适配新的权重结构 (优先加载完整 state_dict)
     if "state_dict" in checkpoint:
         try:
             model.load_state_dict(checkpoint["state_dict"])
             print(">>> Successfully loaded FULL model (Encoder + Head).")
         except Exception as e:
             print(f"!!! Error loading state_dict: {e}")
-            # 尝试从 state_dict 中手动提取键值
             model.load_state_dict(checkpoint["state_dict"], strict=False)
     elif "encoder" in checkpoint:
-        # 旧格式兼容
         print("!!! Warning: Checkpoint contains 'encoder' only. Head might be random.")
         model.encoder.load_state_dict(checkpoint["encoder"])
     else:
-        # 假设直接是 state_dict
         model.load_state_dict(checkpoint)
     
     model.eval()
@@ -193,8 +190,8 @@ def main(args):
     val_ds = JSONLInstructDataset(args.jsonl_path, args.seq_len, args.input_channels, split="val")
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=True, collate_fn=instruct_collate_fn)
     
-    # 4. 推理
-    print(f">>> Visualizing {args.num_samples} samples...")
+    # 4. 推理与可视化
+    print(f">>> Visualizing {args.num_samples} samples (Masked & Unmasked)...")
     output_dir = Path("vis_results")
     output_dir.mkdir(exist_ok=True)
     
@@ -204,27 +201,38 @@ def main(args):
                 break
             
             series = series.to(device)
-            # 使用 0.75 的高 Mask Ratio 以制造更多真正的盲区
-            # 或者保持 0.4 看看重叠修正后的效果
+            
+            # --- 场景 1: 带 Mask (Mask Ratio = 0.4) ---
             gt, pred, mask_map = model.forward_viz(series, mask_ratio=0.4)
             
-            # 只画第一个通道
             gt_np = gt[0, :, 0].cpu().numpy()
             pred_np = pred[0, :, 0].cpu().numpy()
             mask_np = mask_map[0, :].cpu().numpy()
             
-            plot_sample(gt_np, pred_np, mask_np, output_dir / f"sample_{i}.png", i)
+            plot_sample(gt_np, pred_np, mask_np, 
+                        output_dir / f"masked_sample_{i}.png", 
+                        title=f"Sample {i}: Masked Reconstruction (Ratio=0.4)")
+            
+            # --- 场景 2: 无 Mask (Pure Reconstruction, Ratio = 0.0) ---
+            # 直接使用相同的 series 进行纯重建
+            _, pred_clean, mask_clean = model.forward_viz(series, mask_ratio=0.0)
+            
+            pred_clean_np = pred_clean[0, :, 0].cpu().numpy()
+            mask_clean_np = mask_clean[0, :].cpu().numpy() # 应该是全0
+            
+            plot_sample(gt_np, pred_clean_np, mask_clean_np, 
+                        output_dir / f"recon_sample_{i}.png",
+                        title=f"Sample {i}: Pure Reconstruction (No Mask)")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--jsonl-path", type=str, default="sft_full_data_en.jsonl")
+    parser.add_argument("--jsonl-path", type=str, default="/root/emhua/btwu/CROME2/data/gifteval_windows1.jsonl")
     parser.add_argument("--checkpoint", type=str, default="patchtst_pretrained_full.pth")
-    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--input-channels", type=int, default=1)
-    parser.add_argument("--patch-len", type=int, default=32)
-    parser.add_argument("--patch-stride", type=int, default=16)
-    parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-2-7b-hf",
-                        help="LLM模型路径，用于获取embed_dim（虽然测试不直接使用LLM）")
+    parser.add_argument("--patch-len", type=int, default=16)
+    parser.add_argument("--patch-stride", type=int, default=8)
+    parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-3.2-3B")
     parser.add_argument("--num-samples", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--gpu-id", type=str, default=None)

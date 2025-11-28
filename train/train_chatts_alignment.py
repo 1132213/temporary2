@@ -264,7 +264,16 @@ def train_chatts_alignment(args):
         
         for step, batch in enumerate(progress):
             # 计算 loss
-            loss = compute_chatts_loss(model, batch, device) / accumulation_steps
+            loss = compute_chatts_loss(model, batch, device)
+            
+            # === DDP 安全的 NaN 处理 ===
+            if torch.isnan(loss) or torch.isinf(loss):
+                if rank == 0:
+                    logger.warning(f"!!! NaN detected at Epoch {epoch+1} Step {step}. Zeroing loss.")
+                loss = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            # 归一化 (Gradient Accumulation)
+            loss = loss / accumulation_steps
             loss.backward()
             
             train_loss_sum += loss.item() * accumulation_steps

@@ -19,18 +19,23 @@ else
 fi
 
 # 训练参数配置
+LAST_MODEL="p8"
+MODEL_SUFFIX=$LAST_MODEL
+# MODEL_SUFFIX="nonoverlap_merged"
+
 JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned.jsonl"
-PRETRAINED_PATH="model/patchtst_pretrained_full.pth"
+PRETRAINED_PATH="model/patchtst_pretrained_full_$MODEL_SUFFIX.pth"
 LLM_PATH="/root/emhua/btwu/Llama-3.2-3B"
 
 # 训练超参数
 BATCH_SIZE=4          # 每个GPU的批次大小
 GRAD_ACCUM=16          # 梯度累积步数
 EPOCHS=5
-LR=1.5e-3
+LR=8e-4
 SEQ_LEN=256
-PATCH_LEN=16
+PATCH_LEN=8
 PATCH_STRIDE=8
+# PATCH_STRIDE=8
 
 # 计算有效批次大小
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * BATCH_SIZE * GRAD_ACCUM))
@@ -47,13 +52,13 @@ echo "学习率: $LR"
 echo "=========================================="
 echo ""
 
-# 使用 torchrun 启动分布式训练
-torchrun --nproc_per_node=$NUM_GPUS \
-    --master_port=29500 \
+# 构建训练命令
+CMD="torchrun --nproc_per_node=$NUM_GPUS \
+    --master_port=29501 \
     train/train_chatts_alignment_ddp.py \
-    --jsonl-path "$JSONL_PATH" \
-    --pretrained-encoder-path "$PRETRAINED_PATH" \
-    --llm-model-path "$LLM_PATH" \
+    --jsonl-path \"$JSONL_PATH\" \
+    --pretrained-encoder-path \"$PRETRAINED_PATH\" \
+    --llm-model-path \"$LLM_PATH\" \
     --seq-len $SEQ_LEN \
     --patch-len $PATCH_LEN \
     --patch-stride $PATCH_STRIDE \
@@ -62,7 +67,16 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lr $LR \
     --epochs $EPOCHS \
     --num-workers 4 \
-    --seed 42
+    --seed 42"
+
+# 如果设置了模型后缀，添加参数
+if [ -n "$MODEL_SUFFIX" ]; then
+    CMD="$CMD --model-suffix \"$MODEL_SUFFIX\""
+    echo "模型后缀: $MODEL_SUFFIX"
+fi
+
+# 使用 torchrun 启动分布式训练
+eval $CMD
 
 echo ""
 echo "训练完成！"

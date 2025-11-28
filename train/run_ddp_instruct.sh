@@ -16,18 +16,24 @@ else
 fi
 
 # 训练参数配置
-JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/sft/train_cleaned.jsonl"
-STAGE2_CHECKPOINT="model/chatts_stage2_aligned_ddp.pth"
+LAST_MODEL="nonoverlap"
+# MODEL_SUFFIX=$LAST_MODEL
+MODEL_SUFFIX="nonoverlap_merged"
+
+JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/sft/new_merged.jsonl"
+STAGE2_CHECKPOINT="model/chatts_stage2_aligned_ddp_$LAST_MODEL.pth"
 LLM_PATH="/root/emhua/btwu/Llama-3.2-3B"
+ # 可选：模型名称后缀，例如设置为 "1st" 则保存为 chatts_instruct_best_ddp_1st.pth
 
 # 训练超参数
-BATCH_SIZE=4          # 每个GPU的批次大小
-GRADIENT_ACCUM=8      # 梯度累积步数
-EPOCHS=20
+BATCH_SIZE=2         # 每个GPU的批次大小
+GRADIENT_ACCUM=16      # 梯度累积步数
+EPOCHS=5
 LR=5e-5               # 微调阶段使用较小的学习率
-SEQ_LEN=512
+SEQ_LEN=256
 PATCH_LEN=16
-PATCH_STRIDE=8
+PATCH_STRIDE=16
+# PATCH_STRIDE=8
 
 # 计算有效批次大小
 EFFECTIVE_BATCH_SIZE=$((NUM_GPUS * BATCH_SIZE * GRADIENT_ACCUM))
@@ -45,13 +51,13 @@ echo "Stage 2 权重: $STAGE2_CHECKPOINT"
 echo "=========================================="
 echo ""
 
-# 使用 torchrun 启动分布式训练
-torchrun --nproc_per_node=$NUM_GPUS \
-    --master_port=29501 \
+# 构建训练命令
+CMD="torchrun --nproc_per_node=$NUM_GPUS \
+    --master_port=29502 \
     train/train_chatts_instruct_ddp.py \
-    --jsonl-path "$JSONL_PATH" \
-    --stage2-checkpoint "$STAGE2_CHECKPOINT" \
-    --llm-model-path "$LLM_PATH" \
+    --jsonl-path \"$JSONL_PATH\" \
+    --stage2-checkpoint \"$STAGE2_CHECKPOINT\" \
+    --llm-model-path \"$LLM_PATH\" \
     --seq-len $SEQ_LEN \
     --patch-len $PATCH_LEN \
     --patch-stride $PATCH_STRIDE \
@@ -61,7 +67,19 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --epochs $EPOCHS \
     --num-workers 4 \
     --seed 42 \
-    --freeze-encoder
+    --freeze-encoder \
+    --use-lora \
+    --lora-r 16 \
+    --lora-alpha 32 "
+
+# 如果设置了模型后缀，添加参数
+if [ -n "$MODEL_SUFFIX" ]; then
+    CMD="$CMD --model-suffix \"$MODEL_SUFFIX\""
+    echo "模型后缀: $MODEL_SUFFIX"
+fi
+
+# 使用 torchrun 启动分布式训练
+eval $CMD
 
 echo ""
 echo "训练完成！"
