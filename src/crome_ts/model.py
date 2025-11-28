@@ -27,7 +27,7 @@ class CROMEConfig:
     query_tokens: int = 32
     adapter_hidden_dim: int = 256
     fuse_mode: str = "add"  # or "concat"
-    epsilon: float = 1e-5
+    epsilon: float = 1e-4
     # Stat bypass
     use_stats_projector: bool = True
     stat_fourier_features: int = 64

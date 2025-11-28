@@ -15,6 +15,15 @@ if project_root_str not in sys.path:
 from src.crome_ts.model import CROMEConfig, StatBypassCROMETS1, get_llm_embed_dim
 from src.crome_ts.data_instruct import ChatTSDataset, chatts_collate_fn
 from test.common import set_seed
+
+# === 新增：引入分桶采样器 ===
+try:
+    from train.utils import DistributedLengthGroupedSampler
+except ImportError:
+    print("Warning: Could not import DistributedLengthGroupedSampler from train.utils.")
+    print("Please ensure train/utils.py exists and contains the sampler class.")
+    raise
+
 import argparse
 import torch
 import torch.distributed as dist
@@ -27,7 +36,6 @@ from tqdm import tqdm
 import logging
 from datetime import datetime
 import math
-import os
 
 def setup_distributed():
     """初始化分布式训练环境"""
@@ -67,18 +75,16 @@ def compute_chatts_loss(model, batch, device):
     output_texts = batch["output_texts"]
     
     # 获取 tokenizer
-    # DDP 模式下需要通过 module 访问
     if isinstance(model, DDP):
         tokenizer = model.module.tokenizer.tokenizer
     else:
         tokenizer = model.tokenizer.tokenizer
         
     # === 核心修正 1: 构造带有 EOS 的文本 ===
-    # 确保模型输入和标签都包含 EOS Token，防止“不会闭嘴”和 Loss 对齐错误
     eos_token = tokenizer.eos_token
     output_texts_with_eos = [str(text) + eos_token for text in output_texts]
     
-    # === 核心修正 2: 将带 EOS 的文本传给 Forward ===
+    # === 核心修正 2: 传给模型的是加了 EOS 的文本 ===
     actual_model = model.module if isinstance(model, DDP) else model
     model_out = actual_model.forward_chatts(
         input_texts=input_texts,
@@ -90,10 +96,7 @@ def compute_chatts_loss(model, batch, device):
     llm_out = model_out["llm_outputs"]
     logits = llm_out.logits  # [B, Total_L, Vocab]
     
-    # === 核心修正 3: 生成标签 (保持默认行为) ===
-    # tokenizer 默认行为 (add_special_tokens=True) 会添加 BOS
-    # 这样 Input = [BOS, ..., EOS], Label = [BOS, ..., EOS]
-    # 错位预测时刚好对齐
+    # === 核心修正 3: 生成标签 ===
     suffix_labels = tokenizer(
         output_texts_with_eos, 
         return_tensors="pt", 
@@ -105,7 +108,7 @@ def compute_chatts_loss(model, batch, device):
     batch_size = logits.shape[0]
     suffix_mask_lengths = model_out["suffix_mask_lengths"]
     
-    # 计算每个样本的 suffix 起始位置
+    # 计算每个样本的 loss
     losses = []
     for i in range(batch_size):
         # 获取该样本的有效长度（排除padding）
@@ -119,18 +122,18 @@ def compute_chatts_loss(model, batch, device):
         suffix_start = int(valid_len - suffix_len)
         
         # 提取 logits 和 labels
-        sample_logits = logits[i, suffix_start:suffix_start+suffix_len, :]  # [suffix_len, Vocab]
-        sample_labels = suffix_labels[i, :suffix_len]  # [suffix_len]
+        sample_logits = logits[i, suffix_start:suffix_start+suffix_len, :]
+        sample_labels = suffix_labels[i, :suffix_len]
         
-        # 对齐截断 (防止 tokenizer padding 导致的微小长度差异)
+        # 对齐截断
         min_len = min(sample_logits.shape[0], sample_labels.shape[0])
         sample_logits = sample_logits[:min_len]
         sample_labels = sample_labels[:min_len]
         
         # Causal LM: 预测下一个 token
         if sample_logits.shape[0] > 1:
-            shift_logits = sample_logits[:-1, :]  # [suffix_len-1, Vocab]
-            shift_labels = sample_labels[1:]  # [suffix_len-1]
+            shift_logits = sample_logits[:-1, :]
+            shift_labels = sample_labels[1:]
             
             # 计算交叉熵损失
             loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
@@ -143,9 +146,7 @@ def compute_chatts_loss(model, batch, device):
     return torch.stack(losses).mean()
 
 def evaluate(model, val_loader, device, rank):
-    """
-    验证函数 - 支持分布式
-    """
+    """验证函数 - 支持分布式"""
     model.eval()
     total_loss = 0
     num_batches = 0
@@ -168,7 +169,7 @@ def evaluate(model, val_loader, device, rank):
 
 def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
     """
-    多卡分布式训练主函数
+    多卡分布式训练主函数 - Stage 2 对齐训练 (支持动态长度分桶)
     """
     # 设置设备
     device = torch.device(f"cuda:{local_rank}")
@@ -202,7 +203,6 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
     if rank == 0 and logger:
         logger.info(f">>> LLM Embedding Dimension: {llm_embed_dim} (from {args.llm_model_path})")
     
-    # ChatTS 格式中每个时间序列都是单通道
     input_channels = 1
     
     config = CROMEConfig(
@@ -259,7 +259,7 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
                 fixed_dict[new_k] = v
             return fixed_dict
         
-        # 适配新的保存格式
+        # 适配各种保存格式
         if "state_dict" in checkpoint:
             encoder_dict = {k.replace("encoder.", ""): v for k, v in checkpoint["state_dict"].items() if k.startswith("encoder.")}
             if encoder_dict:
@@ -302,7 +302,7 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
             model, 
             device_ids=[local_rank], 
             output_device=local_rank,
-            find_unused_parameters=True  # 因为某些参数可能不参与梯度计算
+            find_unused_parameters=True
         )
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -311,22 +311,40 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
     
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     
-    # 5. 数据加载 - 使用 DistributedSampler
+    # ==================== 5. 数据加载 (修改支持动态长度与分桶) ====================
     if rank == 0 and logger:
         logger.info(f">>> Loading ChatTS Dataset from {args.jsonl_path}...")
     
-    train_ds = ChatTSDataset(args.jsonl_path, args.seq_len, input_channels, split="train")
-    val_ds = ChatTSDataset(args.jsonl_path, args.seq_len, input_channels, split="val")
+    # 修改：传入 patch_stride 用于对齐；seq_len 作为最大长度限制
+    train_ds = ChatTSDataset(
+        args.jsonl_path, 
+        seq_len=args.seq_len, # 这里的 seq_len 语义变为 max_len
+        input_channels=input_channels, 
+        split="train",
+        patch_stride=args.patch_stride # 传入 stride
+    )
+    val_ds = ChatTSDataset(
+        args.jsonl_path, 
+        seq_len=args.seq_len, 
+        input_channels=input_channels, 
+        split="val",
+        patch_stride=args.patch_stride
+    )
     
-    # 使用分布式采样器
-    train_sampler = DistributedSampler(
+    # 使用分桶采样器 DistributedLengthGroupedSampler
+    if rank == 0 and logger:
+        logger.info(f">>> Using DistributedLengthGroupedSampler for bucketing.")
+        
+    train_sampler = DistributedLengthGroupedSampler(
         train_ds, 
-        num_replicas=world_size, 
+        batch_size=args.batch_size, 
+        world_size=world_size, 
         rank=rank, 
         shuffle=True,
         seed=args.seed
-    ) if world_size > 1 else None
+    )
     
+    # 验证集使用普通 DistributedSampler
     val_sampler = DistributedSampler(
         val_ds,
         num_replicas=world_size,
@@ -338,7 +356,7 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         train_ds, 
         batch_size=args.batch_size, 
         sampler=train_sampler,
-        shuffle=(train_sampler is None),  # 如果使用 sampler，则不能 shuffle
+        shuffle=False, # 使用 Sampler 时必须为 False
         collate_fn=chatts_collate_fn,
         num_workers=args.num_workers,
         drop_last=True,
@@ -380,14 +398,13 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         logger.info(f">>> Effective Batch Size: {args.batch_size * accumulation_steps * world_size}")
     
     for epoch in range(args.epochs):
-        # 设置 epoch（对于 DistributedSampler 很重要）
+        # 必须设置 epoch，以便 Sampler 能够确定性地 shuffle
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
         model.train()
         train_loss_sum = 0
         
-        # 只在 rank 0 上显示进度条
         if rank == 0:
             progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [ChatTS-Align-DDP]")
         else:
@@ -396,41 +413,35 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         optimizer.zero_grad()
         
         for step, batch in enumerate(progress):
-            # 计算 loss
             loss = compute_chatts_loss(model, batch, device)
             
-            # === DDP 安全的 NaN 处理 ===
+            # DDP 安全的 NaN 处理
             if torch.isnan(loss) or torch.isinf(loss):
                 if rank == 0:
                     logger.warning(f"!!! NaN detected at Epoch {epoch+1} Step {step}. Zeroing loss.")
                 loss = torch.tensor(0.0, device=device, requires_grad=True)
             
-            # 归一化 (Gradient Accumulation)
             loss = loss / accumulation_steps
             loss.backward()
             
             train_loss_sum += loss.item() * accumulation_steps
             
-            # 梯度累积更新
             if (step + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
             
-            # 只在 rank 0 上更新进度条
             if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 progress.set_postfix(loss=loss.item() * accumulation_steps, lr=f"{current_lr:.2e}")
         
-        # 处理剩余梯度
         if len(train_loader) % accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
         
-        # 同步所有进程的训练损失
         avg_train_loss = train_loss_sum / len(train_loader)
         if dist.is_initialized():
             train_loss_tensor = torch.tensor(avg_train_loss, device=device)
@@ -446,14 +457,12 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         # 只在 rank 0 上保存模型
         if rank == 0 and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            # 根据 model_suffix 参数构建模型文件名
             if args.model_suffix:
                 model_filename = f"chatts_stage2_aligned_ddp_{args.model_suffix}.pth"
             else:
                 model_filename = "chatts_stage2_aligned_ddp.pth"
             save_path = model_dir / model_filename
             
-            # 获取实际模型（去除 DDP wrapper）
             model_to_save = model.module if isinstance(model, DDP) else model
             
             # 只保存非 LLM 的部分
@@ -464,7 +473,6 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
             if logger:
                 logger.info(f">>> Best ChatTS Alignment Model (Filtered LLM) saved to: {save_path}")
         
-        # 同步所有进程（确保所有进程在同一 epoch）
         if dist.is_initialized():
             dist.barrier()
 
@@ -479,7 +487,9 @@ def main():
     parser.add_argument("--pretrained-encoder-path", type=str, 
                         default="model/patchtst_pretrained_full_3b.pth", 
                         help="Stage 1预训练权重路径")
-    parser.add_argument("--seq-len", type=int, default=512, help="时间序列长度")
+    
+    # 修改：seq_len 语义变为最大长度
+    parser.add_argument("--seq-len", type=int, default=2048, help="最大序列长度限制")
     parser.add_argument("--patch-len", type=int, default=16)
     parser.add_argument("--patch-stride", type=int, default=8)
     parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-2-7b-hf")
@@ -492,7 +502,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader 的工作进程数")
     parser.add_argument("--model-suffix", type=str, default="", 
-                        help="模型文件名的后缀，例如：1st，则模型名为 chatts_stage2_aligned_ddp_1st.pth")
+                        help="模型文件名的后缀")
     
     args = parser.parse_args()
     

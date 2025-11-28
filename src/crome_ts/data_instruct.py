@@ -281,7 +281,7 @@ class JSONLInstructDataset(Dataset):
 
 class ChatTSDataset(Dataset):
     """
-    ChatTS 格式的指令微调数据集
+    ChatTS 格式的指令微调数据集 (支持动态长度 + Patch对齐)
     支持从 JSONL 文件加载包含 <ts><ts/> 标记的文本和多个时间序列。
     
     数据格式：
@@ -294,12 +294,14 @@ class ChatTSDataset(Dataset):
     def __init__(
         self,
         jsonl_path: str,
-        seq_len: int,
+        seq_len: Optional[int] = None, # 以前是 seq_len: int，现在变为 Optional，充当 max_len
         input_channels: Optional[int] = None,
         split: str = "train",
         split_ratio: float = 0.9,
+        patch_stride: int = 16, # 新增：用于对齐 Padding
     ):
-        self.seq_len = seq_len
+        self.max_len = seq_len # 重命名语义，仅用于限制最大显存占用
+        self.patch_stride = patch_stride
         
         jsonl_file = Path(jsonl_path)
         if not jsonl_file.exists():
@@ -307,12 +309,30 @@ class ChatTSDataset(Dataset):
         
         # 加载 JSONL 文件
         records = []
+        self.lengths = [] # 新增：用于分桶 (Bucketing)
+
         with jsonl_file.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                records.append(json.loads(line))
+                try:
+                    rec = json.loads(line)
+                    records.append(rec)
+                    
+                    # 估算样本长度用于分桶
+                    # 长度 = 文本长度 + (所有时序长度 / patch_stride)
+                    # 这是一个粗略估计，足以用于将相似长度的样本分在一起
+                    input_text_len = len(rec.get("input", ""))
+                    ts_len_sum = 0
+                    for ts in rec.get("timeseries", []):
+                        ts_len_sum += len(ts)
+                    
+                    # 估算 token 数
+                    estimated_len = input_text_len + (ts_len_sum // 16) 
+                    self.lengths.append(estimated_len)
+                except json.JSONDecodeError:
+                    continue
         
         if len(records) == 0:
             raise ValueError(f"JSONL file is empty: {jsonl_file}")
@@ -329,13 +349,54 @@ class ChatTSDataset(Dataset):
         split_idx = int(len(records) * split_ratio)
         if split == "train":
             self.records = records[:split_idx]
+            self.lengths = self.lengths[:split_idx]
         else:
             self.records = records[split_idx:]
+            self.lengths = self.lengths[split_idx:]
         
-        print(f"[{split.upper()}] Loaded {len(self.records)} samples from {jsonl_file.name}")
+        print(f"[{split.upper()}] Loaded {len(self.records)} samples from {jsonl_file.name} (Dynamic Length Mode)")
     
     def __len__(self):
         return len(self.records)
+
+    def _pad_series(self, array: np.ndarray) -> np.ndarray:
+        """
+        动态 Padding 逻辑：
+        1. 对齐到 patch_stride 的倍数
+        2. 使用最后一个值填充 (Edge Padding)
+        """
+        curr_len = len(array)
+        stride = self.patch_stride
+        
+        # 计算目标长度（向上取整到 stride 的倍数）
+        if curr_len % stride == 0:
+            target_len = curr_len
+        else:
+            target_len = (curr_len // stride + 1) * stride
+        
+        # 限制最大长度 (如果设置了 max_len)
+        if self.max_len is not None and target_len > self.max_len:
+            # 截断，但仍要保证是 stride 倍数
+            target_len = (self.max_len // stride) * stride
+            # 如果截断后比原长度小，说明原数据太长，直接切片
+            if target_len < curr_len:
+                return array[:target_len] 
+        
+        pad_len = target_len - curr_len
+        
+        if pad_len > 0:
+            # 使用最后一个值进行填充
+            # array shape: [L, 1] or [L]
+            last_val = array[-1] if len(array) > 0 else 0.0
+            pad_values = np.full((pad_len, 1), last_val, dtype=array.dtype)
+            
+            # 确保 array 是 [L, 1]
+            if array.ndim == 1:
+                array = array.reshape(-1, 1)
+                
+            array = np.vstack([array, pad_values])
+            
+        return array
     
     def __getitem__(self, idx):
         record = self.records[idx]
@@ -346,7 +407,6 @@ class ChatTSDataset(Dataset):
         output_text = record.get("output", "").strip()
         
         # 处理时间序列数据
-        # timeseries_list 是二维数组，每个元素是一个时间序列
         processed_series = []
         for ts_data in timeseries_list:
             # 将时间序列转换为 numpy 数组
@@ -354,31 +414,24 @@ class ChatTSDataset(Dataset):
             
             # 确保是一维数组
             if array.ndim > 1:
-                # 如果是多维，取第一维
                 array = array.flatten()
             
-            # 处理长度
-            if len(array) > self.seq_len:
-                # 截取最后 seq_len 个时间步
-                array = array[-self.seq_len:]
-            elif len(array) < self.seq_len:
-                # 填充零
-                pad_len = self.seq_len - len(array)
-                array = np.pad(array, (0, pad_len), mode='constant', constant_values=0.0)
-            
-            # 转换为 [T, C] 格式，这里 C=1
+            # 处理为 [T, 1]
             array = array.reshape(-1, 1)
             
             # NaN 处理
             array = np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
             
+            # === 动态 Padding ===
+            array = self._pad_series(array)
+            
             # 转换为 tensor
             ts_tensor = torch.tensor(array, dtype=torch.float32)
             processed_series.append(ts_tensor)
         
-        # 如果没有时间序列数据，创建一个零张量
+        # 如果没有时间序列数据，创建一个最小长度的 Tensor 以防报错
         if len(processed_series) == 0:
-            processed_series = [torch.zeros(self.seq_len, self.input_channels, dtype=torch.float32)]
+            processed_series = [torch.zeros(self.patch_stride, self.input_channels, dtype=torch.float32)]
         
         # 构建返回字典
         return {

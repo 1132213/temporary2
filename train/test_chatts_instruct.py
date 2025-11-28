@@ -50,72 +50,114 @@ def cleanup_distributed():
 # --- 2. 核心功能函数 ---
 
 def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
-    # 保持原逻辑不变，略去以节省篇幅，直接复制原来的即可
     ts_marker = "<ts><ts/>"
     text_parts = input_text.split(ts_marker)
     num_markers = len(text_parts) - 1
     num_timeseries = len(ts_list)
+    
+    # 复制列表以防修改原数据
     timeseries_list = list(ts_list)
+    
+    # === 修改点 1: 处理缺失的时间序列 ===
     if num_timeseries < num_markers:
+        # 既然是占位符，不需要填充到 seq_len (max_len)
+        # 只需要填充一个最小的合法长度 (patch_len)，以节省推理计算量
+        # 且因为是缺失数据，保持全 0 是正确的（没有"最后一个点"可供Padding）
+        min_len = model.config.patch_len
+        
         for _ in range(num_markers - num_timeseries):
-            timeseries_list.append(torch.zeros(model.config.seq_len, model.config.input_channels, device=device))
+            timeseries_list.append(
+                torch.zeros(min_len, model.config.input_channels, device=device)
+            )
+            
     elif num_timeseries > num_markers:
         timeseries_list = timeseries_list[:num_markers]
+        
     segment_embeds = []
     segment_masks = []
     
-    # 兼容 LoRA: 如果用了 LoRA，model.llm.parameters() 可能包含 LoRA 层
-    # 我们只需要获取 dtype，取第一个参数即可
+    # 获取目标 dtype (兼容 LoRA/bf16)
     target_dtype = next(model.llm.parameters()).dtype
     tokenizer = model.tokenizer.tokenizer
     
+    # 1. 处理前缀文本
     if text_parts[0]:
-        prefix_tokens = tokenizer(text_parts[0], return_tensors="pt", add_special_tokens=True).to(device)
+        prefix_tokens = tokenizer(
+            text_parts[0], 
+            return_tensors="pt", 
+            add_special_tokens=True # 添加 BOS
+        ).to(device)
         prefix_embed = model.llm.embed(prefix_tokens.input_ids)
         prefix_mask = prefix_tokens.attention_mask
         segment_embeds.append(prefix_embed[0])
         segment_masks.append(prefix_mask[0])
     
+    # 2. 循环处理 [TS] + [Text]
     for ts_idx, ts_tensor in enumerate(timeseries_list):
         ts_tensor = ts_tensor.to(device)
+        
         ts_batch = ts_tensor.unsqueeze(0)
         
-        # 兼容 LoRA: StatBypassCROMETS1 内部会自动处理 forward 调用
-        # 这里 _process_single_channel 是 ts_model 的方法，不受 LoRA 影响
-        stat_token, ts_tokens = model.ts_model._process_single_channel(ts_batch, instruction_embeds=None)
+        # === 核心: 这里的 ts_tensor 长度是动态的 ===
+        # 只要 Dataset 处理正确（已对齐 stride），这里就能直接通过
+        stat_token, ts_tokens = model.ts_model._process_single_channel(
+            ts_batch, instruction_embeds=None
+        )
         
-        if stat_token.dtype != target_dtype: stat_token = stat_token.to(dtype=target_dtype)
-        if ts_tokens.dtype != target_dtype: ts_tokens = ts_tokens.to(dtype=target_dtype)
+        # 类型对齐
+        if stat_token.dtype != target_dtype: 
+            stat_token = stat_token.to(dtype=target_dtype)
+        if ts_tokens.dtype != target_dtype: 
+            ts_tokens = ts_tokens.to(dtype=target_dtype)
+            
         ts_embed = torch.cat([stat_token[0], ts_tokens[0]], dim=0)
+        
         segment_embeds.append(ts_embed)
+        # 生成对应的 Mask (全1)
         segment_masks.append(torch.ones(ts_embed.shape[0], device=device, dtype=torch.long))
+        
+        # 添加 SEP
         if ts_idx < len(timeseries_list) - 1:
             sep_embed = model.sep_token
-            if sep_embed.dtype != target_dtype: sep_embed = sep_embed.to(dtype=target_dtype)
+            if sep_embed.dtype != target_dtype: 
+                sep_embed = sep_embed.to(dtype=target_dtype)
             segment_embeds.append(sep_embed)
             segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
+        
+        # 处理中间文本
         text_idx = ts_idx + 1
         if text_idx < len(text_parts) and text_parts[text_idx]:
-            text_tokens = tokenizer(text_parts[text_idx], return_tensors="pt", add_special_tokens=False).to(device)
+            text_tokens = tokenizer(
+                text_parts[text_idx], 
+                return_tensors="pt", 
+                add_special_tokens=False # 中间文本不加特殊 Token
+            ).to(device)
             text_embed = model.llm.embed(text_tokens.input_ids)
             text_mask = text_tokens.attention_mask
             segment_embeds.append(text_embed[0])
             segment_masks.append(text_mask[0])
     
+    # 3. 最终组装
     if segment_embeds:
         full_embed = torch.cat(segment_embeds, dim=0)
         full_mask = torch.cat(segment_masks, dim=0)
+        
+        # 添加生成触发符 (BOS/EOS 视模型而定，通常生成任务需要一个触发)
+        # 这里逻辑保持原样，追加一个 token 提示 LLM 开始生成
         bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
         bos_tensor = torch.tensor([[bos_token_id]], device=device)
         bos_embed = model.llm.embed(bos_tensor)
         bos_mask = torch.ones(1, device=device, dtype=torch.long)
+        
         full_embed = torch.cat([full_embed, bos_embed[0]], dim=0)
         full_mask = torch.cat([full_mask, bos_mask], dim=0)
+        
         assembled_embeds = full_embed.unsqueeze(0)
         attention_mask = full_mask.unsqueeze(0)
     else:
         assembled_embeds = torch.empty(1, 0, model.config.llm_embed_dim, device=device)
         attention_mask = torch.empty(1, 0, device=device, dtype=torch.long)
+        
     return assembled_embeds, attention_mask
 
 def compute_test_loss(model, dataloader, device, rank):
@@ -335,7 +377,13 @@ def main():
     model.eval()
 
     # 数据集
-    val_ds = ChatTSDataset(args.jsonl_path, args.seq_len, input_channels, split="val")
+    val_ds = ChatTSDataset(
+        args.jsonl_path, 
+        seq_len=args.seq_len, # 作为 max_len
+        input_channels=input_channels, 
+        split="val",
+        patch_stride=args.patch_stride # <--- 新增：传入 stride
+    )
     sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
     
     if args.calc_loss:

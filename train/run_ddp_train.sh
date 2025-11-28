@@ -19,12 +19,13 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="p8"
-MODEL_SUFFIX=$LAST_MODEL
-# MODEL_SUFFIX="nonoverlap_merged"
+LAST_MODEL="nonoverlap"
+# MODEL_SUFFIX=$LAST_MODEL
+MODEL_SUFFIX="nonoverlap_changelen"
 
-JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned.jsonl"
-PRETRAINED_PATH="model/patchtst_pretrained_full_$MODEL_SUFFIX.pth"
+# JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned.jsonl"
+JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/my_data/alignment.jsonl"
+PRETRAINED_PATH="model/patchtst_pretrained_full_$LAST_MODEL.pth"
 LLM_PATH="/root/emhua/btwu/Llama-3.2-3B"
 
 # 训练超参数
@@ -32,9 +33,9 @@ BATCH_SIZE=4          # 每个GPU的批次大小
 GRAD_ACCUM=16          # 梯度累积步数
 EPOCHS=5
 LR=8e-4
-SEQ_LEN=256
-PATCH_LEN=8
-PATCH_STRIDE=8
+SEQ_LEN=1024
+PATCH_LEN=16
+PATCH_STRIDE=16
 # PATCH_STRIDE=8
 
 # 计算有效批次大小

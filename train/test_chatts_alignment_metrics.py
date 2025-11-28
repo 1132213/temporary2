@@ -307,7 +307,7 @@ def main():
         llm_device_map=device_str,
         llm_dtype="bfloat16",
         use_stats_projector=True,
-        epsilon=1e-5,
+        epsilon=1e-4,
     )
     
     # 加载模型
@@ -325,7 +325,13 @@ def main():
     
     # 加载数据
     print(f"\n>>> Loading Dataset...")
-    val_ds = ChatTSDataset(args.jsonl_path, args.seq_len, input_channels, split="val")
+    val_ds = ChatTSDataset(
+        args.jsonl_path, 
+        seq_len=args.seq_len, # 作为 max_len
+        input_channels=input_channels, 
+        split="val",
+        patch_stride=args.patch_stride # <--- 新增：传入 stride 以启用动态对齐和 Edge Padding
+    )
     
     # 限制样本数量
     if args.num_samples > 0 and args.num_samples < len(val_ds):
