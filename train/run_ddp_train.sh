@@ -21,18 +21,18 @@ fi
 # 训练参数配置
 LAST_MODEL="nonoverlap"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="nonoverlap_changelen"
+MODEL_SUFFIX="stat"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned.jsonl"
 JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/my_data/alignment.jsonl"
 PRETRAINED_PATH="model/patchtst_pretrained_full_$LAST_MODEL.pth"
-LLM_PATH="/root/emhua/btwu/Llama-3.2-3B"
+LLM_PATH="/root/emhua/btwu/Qwen2.5-3B-Instruct"
 
 # 训练超参数
-BATCH_SIZE=4          # 每个GPU的批次大小
+BATCH_SIZE=2          # 每个GPU的批次大小
 GRAD_ACCUM=16          # 梯度累积步数
 EPOCHS=5
-LR=8e-4
+LR=1e-3
 SEQ_LEN=1024
 PATCH_LEN=16
 PATCH_STRIDE=16

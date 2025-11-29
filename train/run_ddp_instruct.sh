@@ -16,19 +16,19 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="nonoverlap_changelen"
+LAST_MODEL="stat"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="nonoverlap_changelen"
+MODEL_SUFFIX="stat"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/sft/new_merged.jsonl"
 JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/my_data/sft.jsonl"
 STAGE2_CHECKPOINT="model/chatts_stage2_aligned_ddp_$LAST_MODEL.pth"
-LLM_PATH="/root/emhua/btwu/Llama-3.2-3B"
+LLM_PATH="/root/emhua/btwu/Qwen2.5-3B-Instruct"
  # 可选：模型名称后缀，例如设置为 "1st" 则保存为 chatts_instruct_best_ddp_1st.pth
 
 # 训练超参数
-BATCH_SIZE=2         # 每个GPU的批次大小
-GRADIENT_ACCUM=16      # 梯度累积步数
+BATCH_SIZE=1         # 每个GPU的批次大小
+GRADIENT_ACCUM=32      # 梯度累积步数
 EPOCHS=5
 LR=5e-5               # 微调阶段使用较小的学习率
 SEQ_LEN=1024

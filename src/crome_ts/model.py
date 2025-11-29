@@ -568,6 +568,29 @@ class StatBypassCROMETS1(nn.Module):
                 # 确保时间序列在正确的设备上
                 ts_tensor = ts_tensor.to(device)
                 
+                # 1. 计算统计量 (注意处理空序列或全0序列的情况)
+                if ts_tensor.numel() > 0:
+                    ts_mean = ts_tensor.mean().item()
+                    ts_std = ts_tensor.std().item()
+                    ts_min = ts_tensor.min().item()
+                    ts_max = ts_tensor.max().item()
+                else:
+                    ts_mean = ts_std = ts_min = ts_max = 0.0
+                
+                # 2. 构造统计量文本字符串
+                # 格式可以自定义，建议简洁明了
+                stats_str = f" [Stats: mean={ts_mean:.2f}, std={ts_std:.2f}, min={ts_min:.2f}, max={ts_max:.2f}] "
+                
+                # 3. Tokenize 并生成 Embedding
+                # 注意：这里 add_special_tokens=False，因为它是插入在中间的文本
+                stats_encoded = self.tokenizer([stats_str], device)
+                stats_embed = self.llm.embed(stats_encoded["input_ids"]) # [1, L_stats, D]
+                stats_mask = stats_encoded["attention_mask"] # [1, L_stats]
+                
+                # 4. 添加到 segment 列表 (插入在时间序列之前)
+                segment_embeds.append(stats_embed[0])
+                segment_masks.append(stats_mask[0])
+                
                 # 添加 batch 维度：[T, C] -> [1, T, C]
                 ts_batch = ts_tensor.unsqueeze(0)
                 

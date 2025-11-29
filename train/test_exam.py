@@ -29,13 +29,13 @@ from src.crome_ts.model import CROMEConfig, StatBypassCROMETS1, get_llm_embed_di
 from src.crome_ts.data_instruct import ChatTSDataset, chatts_collate_fn
 
 # ==========================================
-# 1. 修复 Dataset：强行读取 Category
+# 1. 修复 Dataset：透传参数并读取 Category
 # ==========================================
 class ExamChatTSDataset(ChatTSDataset):
     def __init__(self, jsonl_path, *args, **kwargs):
+        # [Corrected] 用户确认底层支持 patch_stride，直接透传 kwargs
         super().__init__(jsonl_path, *args, **kwargs)
         
-        # [Fix] 显式重新读取文件以获取 category
         self.raw_categories = []
         try:
             with open(jsonl_path, 'r', encoding='utf-8') as f:
@@ -61,7 +61,7 @@ def exam_collate_fn(batch):
     return batch_dict
 
 # ==========================================
-# 2. Embedding 构建 (逻辑保持不变)
+# 2. Embedding 构建 (ChatML 适配版)
 # ==========================================
 def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
     ts_marker = "<ts><ts/>"
@@ -71,7 +71,7 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
     
     if len(timeseries_list) < num_markers:
         for _ in range(num_markers - len(timeseries_list)):
-            timeseries_list.append(torch.zeros(model.config.patch_len, model.config.input_channels, device=device))
+            timeseries_list.append(torch.zeros(model.config.seq_len, model.config.input_channels, device=device))
     elif len(timeseries_list) > num_markers:
         timeseries_list = timeseries_list[:num_markers]
         
@@ -81,13 +81,16 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
     
     # 1. Prefix
     if text_parts[0]:
-        tokens = tokenizer(text_parts[0], return_tensors="pt", add_special_tokens=True).to(device)
+        # Qwen 格式下，Prompt 开头通常已有 <|im_start|>，这里 add_special_tokens=False 更稳妥
+        # 但如果 tokenizer 配置为自动加 BOS 且不冲突，也可以 True。这里为了安全设为 False
+        tokens = tokenizer(text_parts[0], return_tensors="pt", add_special_tokens=False).to(device)
         segment_embeds.append(model.llm.embed(tokens.input_ids)[0])
         segment_masks.append(tokens.attention_mask[0])
     
     # 2. TS + Middle Text
     for idx, ts in enumerate(timeseries_list):
         ts = ts.to(device).unsqueeze(0)
+        # 兼容 LoRA: 调用内部 ts_model 方法
         stat_token, ts_tokens = model.ts_model._process_single_channel(ts)
         
         if stat_token.dtype != target_dtype: stat_token = stat_token.to(dtype=target_dtype)
@@ -112,13 +115,6 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
     if segment_embeds:
         full_emb = torch.cat(segment_embeds, dim=0)
         full_msk = torch.cat(segment_masks, dim=0)
-        
-        bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 1
-        bos = torch.tensor([[bos_token_id]], device=device)
-        
-        full_emb = torch.cat([full_emb, model.llm.embed(bos)[0]], dim=0)
-        full_msk = torch.cat([full_msk, torch.ones(1, device=device, dtype=torch.long)], dim=0)
-        
         return full_emb.unsqueeze(0), full_msk.unsqueeze(0)
     
     return torch.empty(1,0,model.config.llm_embed_dim).to(device), torch.empty(1,0).to(device)
@@ -128,7 +124,7 @@ def compute_test_loss(model, dataloader, device, rank):
     return 0.0
 
 # ==========================================
-# 3. 生成预测
+# 3. 生成预测 (ChatML + 截断)
 # ==========================================
 def generate_predictions(model, dataloader, device, output_file, rank, max_samples=None):
     model.eval()
@@ -153,7 +149,10 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
             for i in range(len(input_texts)):
                 if max_samples and sample_count >= max_samples: break
                 
-                full_input = f"User: {input_texts[i]}\nAssistant: "
+                # [FIX] 切换为 Qwen ChatML 格式
+                # input_texts[i] 已经包含了 <ts><ts/>
+                full_input = f"<|im_start|>user\n{input_texts[i]}<|im_end|>\n<|im_start|>assistant\n"
+                
                 try:
                     embeds, mask = build_chatts_embeddings_for_inference(model, full_input, ts_lists[i], device)
                     
@@ -164,16 +163,25 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
                         min_new_tokens=1,   
                         pad_token_id=tokenizer.pad_token_id, 
                         eos_token_id=tokenizer.eos_token_id,
-                        bos_token_id=tokenizer.bos_token_id,
-                        do_sample=False
+                        # Qwen 的 EOS 通常是 <|im_end|>
+                        # bos_token_id=tokenizer.bos_token_id, 
+                        do_sample=False,
+                        repetition_penalty=1.1
                     )
                     pred = tokenizer.decode(outs[0], skip_special_tokens=True)
+                    
+                    # [FIX] Qwen 适配截断逻辑
+                    stop_words = ["<|im_end|>", "<|im_start|>", "user", "model", "Assistant:"]
+                    for stop_word in stop_words:
+                        idx = pred.find(stop_word)
+                        if idx != -1:
+                            pred = pred[:idx]
+                    pred = pred.strip()
                     
                     results.append({
                         "ground_truth": gts[i],
                         "prediction": pred,
                         "category": cats[i],
-                        # [Modified] 保存完整 Input Text，以便后续 Judge 使用
                         "full_input_text": input_texts[i] 
                     })
                     sample_count += 1
@@ -189,13 +197,7 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
 # 4. 独立 AI 裁判逻辑 (加载新模型)
 # ==========================================
 def run_ai_judge(model, tokenizer, input_text, gt, pred, device):
-    """
-    使用独立的 Judge 模型进行判定。
-    Prompt 中包含：题目与选项(无TS)、Ground Truth、Prediction
-    """
-    # [Clean] 去除 <ts><ts/> 标记，只保留纯文本供 AI 阅读
     clean_input = input_text.replace("<ts><ts/>", "").strip()
-    
     prompt = (
         "You are an exam grader.\n"
         "Your task is to determine if the Candidate's Prediction matches the Ground Truth for the given Question.\n\n"
@@ -209,7 +211,6 @@ def run_ai_judge(model, tokenizer, input_text, gt, pred, device):
     )
     
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    
     with torch.no_grad():
         output_ids = model.generate(
             inputs.input_ids,
@@ -218,60 +219,37 @@ def run_ai_judge(model, tokenizer, input_text, gt, pred, device):
             temperature=0.0,
             pad_token_id=tokenizer.pad_token_id
         )
-    
     judge_output = tokenizer.decode(output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
     
-    if "1" in judge_output:
-        return 1
-    elif "0" in judge_output:
-        return 0
+    if "1" in judge_output: return 1
+    elif "0" in judge_output: return 0
     else:
-        # Fallback
-        gt_clean = gt.strip().upper()
-        pred_clean = pred.strip().upper()
-        if gt_clean in pred_clean:
-            return 1
+        if gt.strip().upper() in pred.strip().upper(): return 1
         return 0
 
 def evaluate_exam_results_with_judge_model(results_list, judge_model_path, device):
-    """
-    加载指定的 Judge 模型进行评测
-    """
     print(f"\n>>> Loading Judge Model from: {judge_model_path}")
-    
-    # 加载 Judge 模型
     tokenizer = AutoTokenizer.from_pretrained(judge_model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    model = AutoModelForCausalLM.from_pretrained(
-        judge_model_path, 
-        torch_dtype=torch.bfloat16, 
-        device_map=device
-    )
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(judge_model_path, torch_dtype=torch.bfloat16, device_map=device)
     model.eval()
     
     total_stats = {"correct": 0, "total": 0}
     cat_stats = defaultdict(lambda: {"correct": 0, "total": 0})
     
     print(f"\n>>> Starting AI Evaluation on {len(results_list)} samples...")
-    
     for i, item in enumerate(tqdm(results_list, desc="AI Judging")):
         gt = item.get("ground_truth", "").strip()
         pred = item.get("prediction", "").strip()
         cat = item.get("category", "Uncategorized")
-        
-        # [Modified] 获取完整 input text 传给 judge
         input_text = item.get("full_input_text", "")
         
         is_correct_val = run_ai_judge(model, tokenizer, input_text, gt, pred, device)
-        
         item["judge_score"] = is_correct_val
         item["judge_model"] = judge_model_path 
         
         total_stats["total"] += 1
         cat_stats[cat]["total"] += 1
-        
         if is_correct_val == 1:
             total_stats["correct"] += 1
             cat_stats[cat]["correct"] += 1
@@ -280,17 +258,45 @@ def evaluate_exam_results_with_judge_model(results_list, judge_model_path, devic
     print(f"Judge Model: {judge_model_path}")
     print(f"{'Category':<35} | {'Acc':<8} | {'Correct':<8} | {'Total':<8}")
     print("-" * 75)
+
+    # [MODIFIED] 定义强制排序列表
+    forced_order = [
+        "Pattern Recognition",
+        "Noise Understanding",
+        "Anomaly Detection", 
+        "Similarity Analysis",
+        "Causality Analysis"
+    ]
     
-    for cat in sorted(cat_stats.keys()):
+    printed_categories = set()
+
+    # 1. 先打印强制排序的类别
+    for cat in forced_order:
+        # 简单容错：如果 JSONL 数据里真的是 "Anolmaly" (Typo)，这里做一个映射处理
+        target_key = cat
+        if cat not in cat_stats and "Anolmaly Detection" in cat_stats and cat == "Anomaly Detection":
+            target_key = "Anolmaly Detection"
+
+        if target_key in cat_stats:
+            s = cat_stats[target_key]
+            acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
+            # 打印时如果原本是错别字，这里还是打印数据里的 key (target_key)，或者你可以强制显示 cat (修正后的拼写)
+            print(f"{target_key:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
+            printed_categories.add(target_key)
+    
+    # 2. 打印剩下的类别 (防止有漏网之鱼，按字母顺序)
+    remaining_cats = sorted([c for c in cat_stats.keys() if c not in printed_categories])
+    for cat in remaining_cats:
         s = cat_stats[cat]
         acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
         print(f"{cat:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
-        
+
     print("-" * 75)
+    
+    # 3. 最后打印 OVERALL
     total_acc = (total_stats['correct'] / total_stats['total']) * 100 if total_stats['total'] > 0 else 0.0
     print(f"{'OVERALL':<35} | {total_acc:<7.2f}% | {total_stats['correct']:<8} | {total_stats['total']:<8}")
     print("=" * 75 + "\n")
-    
     return results_list
 
 # ==========================================
@@ -327,9 +333,7 @@ def main():
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
     
-    # -------------------------------------------------------
     # Phase 1: Generation
-    # -------------------------------------------------------
     config = CROMEConfig(
         input_channels=1,
         llm_embed_dim=get_llm_embed_dim(args.llm_model_path),
@@ -350,12 +354,13 @@ def main():
     if rank == 0: print(f">>> Loading Checkpoint: {args.checkpoint}")
     model.load_state_dict(torch.load(args.checkpoint, map_location=device), strict=False)
     
+    # [Corrected] 传入 patch_stride
     ds = ExamChatTSDataset(
         args.jsonl_path, 
         seq_len=args.seq_len, 
         split="val",
         split_ratio=0.0, 
-        patch_stride=args.patch_stride
+        patch_stride=args.patch_stride 
     )
     
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=False)
@@ -368,9 +373,7 @@ def main():
     
     if dist.is_initialized(): dist.barrier()
     
-    # -------------------------------------------------------
     # Phase 2: Evaluation
-    # -------------------------------------------------------
     if rank == 0:
         print(f">>> Merging results from all {world_size} ranks...")
         merged_results = []
@@ -382,20 +385,14 @@ def main():
                 os.remove(fname)
         
         print(f">>> Total Samples Generated: {len(merged_results)}")
-        
         print(">>> Unloading subject model to free GPU memory for Judge...")
         del model
         torch.cuda.empty_cache()
         
-        final_scored_results = evaluate_exam_results_with_judge_model(
-            merged_results, 
-            args.judge_model_path, 
-            device
-        )
+        final_scored_results = evaluate_exam_results_with_judge_model(merged_results, args.judge_model_path, device)
         
         with open(args.output_file, 'w', encoding='utf-8') as f:
-            for item in final_scored_results: 
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            for item in final_scored_results: f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f">>> Final results saved to {args.output_file}")
             
     cleanup_distributed()

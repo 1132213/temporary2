@@ -96,6 +96,28 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
     for ts_idx, ts_tensor in enumerate(timeseries_list):
         ts_tensor = ts_tensor.to(device)
         
+        if ts_tensor.numel() > 0:
+            ts_mean = ts_tensor.mean().item()
+            ts_std = ts_tensor.std().item()
+            ts_min = ts_tensor.min().item()
+            ts_max = ts_tensor.max().item()
+        else:
+            ts_mean = ts_std = ts_min = ts_max = 0.0
+            
+        stats_str = f" [Stats: mean={ts_mean:.2f}, std={ts_std:.2f}, min={ts_min:.2f}, max={ts_max:.2f}] "
+        
+        stats_tokens = tokenizer(
+            stats_str, 
+            return_tensors="pt", 
+            add_special_tokens=False # 不加 BOS
+        ).to(device)
+        
+        stats_embed = model.llm.embed(stats_tokens.input_ids)
+        stats_mask = stats_tokens.attention_mask
+        
+        segment_embeds.append(stats_embed[0])
+        segment_masks.append(stats_mask[0])
+        
         ts_batch = ts_tensor.unsqueeze(0)
         
         # === 核心: 这里的 ts_tensor 长度是动态的 ===
@@ -180,7 +202,7 @@ def compute_test_loss(model, dataloader, device, rank):
                 ts_list = timeseries_lists[i]
                 output_text = output_texts[i]
                 ts_list_device = [ts.unsqueeze(0).to(device) for ts in ts_list]
-                prefix = f"User: {input_text}\nAssistant: "
+                prefix = f"<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n"
                 if len(ts_list_device) > 0: series = ts_list_device[0]
                 else: series = torch.zeros(1, model.config.seq_len, 1, device=device)
                 
@@ -257,7 +279,7 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_new_t
                 input_text = input_texts[i]
                 ts_list = timeseries_lists[i]
                 ground_truth = output_texts[i]
-                full_input = f"User: {input_text}\nAssistant: "
+                full_input = f"<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n"
                 
                 try:
                     inputs_embeds, attention_mask = build_chatts_embeddings_for_inference(
@@ -280,6 +302,14 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_new_t
                     )
                     
                     pred_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                    stop_words = ["<|im_end|>", "<|im_start|>", "user", "model"]
+                    
+                    for stop_word in stop_words:
+                        idx = pred_text.find(stop_word)
+                        if idx != -1:
+                            pred_text = pred_text[:idx]
+                    
+                    pred_text = pred_text.strip()
                     
                     results.append({
                         "id": f"r{rank}_s{sample_count}",
