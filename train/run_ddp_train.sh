@@ -21,9 +21,9 @@ fi
 # 训练参数配置
 LAST_MODEL="nonoverlap"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="stat"
+MODEL_SUFFIX="stat_newfilm_drop"
 
-# JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned.jsonl"
+# JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned_2w.jsonl"
 JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/my_data/alignment.jsonl"
 PRETRAINED_PATH="model/patchtst_pretrained_full_$LAST_MODEL.pth"
 LLM_PATH="/root/emhua/btwu/Qwen2.5-3B-Instruct"

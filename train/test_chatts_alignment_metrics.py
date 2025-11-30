@@ -1,5 +1,5 @@
 """
-测试 Stage 2 对齐效果的专用脚本 (已适配动态长度 + 显式统计量)
+测试 Stage 2 对齐效果的专用脚本 (适配 FiLM, No Stat Token, 显式统计量)
 """
 
 import sys
@@ -21,9 +21,9 @@ from src.crome_ts.data_instruct import ChatTSDataset, chatts_collate_fn
 
 def compute_alignment_loss(model, dataloader, device):
     """
-    计算对齐损失 (自动适配模型内部的 forward_chatts 逻辑)
+    计算对齐损失 (适配模型内部 Text Stats Dropout，推理时应关闭 Dropout)
     """
-    model.eval()
+    model.eval() # 确保 eval 模式，避免触发 Text Stats Dropout
     total_loss = 0
     total_tokens = 0
     correct_predictions = 0
@@ -41,7 +41,7 @@ def compute_alignment_loss(model, dataloader, device):
             output_texts = batch["output_texts"]
             
             try:
-                # model.forward_chatts 内部已经包含了 "显式统计量" 的插入逻辑
+                # model.forward_chatts 
                 model_out = model.forward_chatts(
                     input_texts=input_texts,
                     timeseries_lists=timeseries_lists,
@@ -70,7 +70,6 @@ def compute_alignment_loss(model, dataloader, device):
                     sample_logits = logits[i, suffix_start:suffix_start+suffix_len, :]
                     sample_labels = suffix_labels[i, :suffix_len]
                     
-                    # 长度对齐保护
                     min_len = min(sample_logits.shape[0], sample_labels.shape[0])
                     sample_logits = sample_logits[:min_len]
                     sample_labels = sample_labels[:min_len]
@@ -102,7 +101,7 @@ def compute_alignment_loss(model, dataloader, device):
 
 def compute_embedding_quality(model, dataloader, device, num_samples=100):
     """
-    评估嵌入质量 (已更新：包含显式文本统计量)
+    评估嵌入质量 (适配 FiLM 结构，不再评估 Stat Token)
     """
     model.eval()
     tokenizer = model.tokenizer.tokenizer
@@ -111,8 +110,7 @@ def compute_embedding_quality(model, dataloader, device, num_samples=100):
     print("评估嵌入空间质量")
     print("="*60)
     
-    stat_norms = []       # 隐式 Stat Projector
-    text_stat_norms = []  # ✨ 新增：显式文本统计量
+    text_stat_norms = []  # 显式文本统计量
     query_norms = []
     detail_norms = []
     combined_norms = []
@@ -123,9 +121,8 @@ def compute_embedding_quality(model, dataloader, device, num_samples=100):
             if sample_count >= num_samples: break
                 
             timeseries_lists = batch["timeseries_lists"]
-            input_texts = batch["input_texts"]
             
-            for i in range(len(input_texts)):
+            for i in range(len(timeseries_lists)):
                 if sample_count >= num_samples: break
                 ts_list = timeseries_lists[i]
                 
@@ -134,7 +131,7 @@ def compute_embedding_quality(model, dataloader, device, num_samples=100):
                     ts_batch = ts_tensor.unsqueeze(0)
                     
                     try:
-                        # 1. 计算显式统计量文本的范数 (复用 model.py 的逻辑)
+                        # 1. 计算显式统计量文本范数
                         if ts_tensor.numel() > 0:
                             ts_mean = ts_tensor.mean().item()
                             ts_std = ts_tensor.std().item()
@@ -148,28 +145,32 @@ def compute_embedding_quality(model, dataloader, device, num_samples=100):
                         stats_tokens = tokenizer(
                             stats_str, return_tensors="pt", add_special_tokens=False
                         ).to(device)
-                        stats_embed = model.llm.embed(stats_tokens.input_ids) # [1, L, D]
+                        stats_embed = model.llm.embed(stats_tokens.input_ids)
                         
-                        # ✨ 记录文本统计量范数
                         text_stat_norm = torch.norm(stats_embed, dim=-1).mean().item()
                         text_stat_norms.append(text_stat_norm)
 
-                        # 2. 计算时序相关范数
+                        # 2. 计算时序相关范数 (手动前向传播)
                         x, stats = model.ts_model.preprocessor(ts_batch)
+                        
+                        # 生成 FiLM 参数
+                        gamma, beta = model.ts_model.film_generator(stats)
+                        
                         patch_tokens = model.ts_model.shape_encoder(x)
                         query_tokens = model.ts_model.qformer(patch_tokens, instruction_embeds=None)
                         detail_tokens = model.ts_model.detail_proj(patch_tokens)
                         
                         query_out = model.ts_model.adapter.query_adapter(query_tokens)
-                        detail_out = model.ts_model.adapter.patch_adapter(detail_tokens)
+                        
+                        # 应用 FiLM 到 Detail Path
+                        detail_out = model.ts_model.adapter.patch_adapter(detail_tokens, gamma=gamma, beta=beta)
                         
                         query_projected = model.ts_model.llm_proj(query_out)
                         detail_projected = model.ts_model.llm_proj(detail_out)
-                        stat_token = model.ts_model.stat_projector(stats)
                         
                         combined_projected = torch.cat([query_projected, detail_projected], dim=1)
                         
-                        stat_norms.append(torch.norm(stat_token, dim=-1).mean().item())
+                        # 不再有 stat_norm，只记录 query/detail/combined
                         query_norms.append(torch.norm(query_projected, dim=-1).mean().item())
                         detail_norms.append(torch.norm(detail_projected, dim=-1).mean().item())
                         combined_norms.append(torch.norm(combined_projected, dim=-1).mean().item())
@@ -181,8 +182,7 @@ def compute_embedding_quality(model, dataloader, device, num_samples=100):
                 sample_count += 1
     
     return {
-        "stat_norm": (np.mean(stat_norms), np.std(stat_norms)),
-        "text_stat_norm": (np.mean(text_stat_norms), np.std(text_stat_norms)), # ✨ 新增
+        "text_stat_norm": (np.mean(text_stat_norms), np.std(text_stat_norms)),
         "query_norm": (np.mean(query_norms), np.std(query_norms)),
         "detail_norm": (np.mean(detail_norms), np.std(detail_norms)),
         "combined_norm": (np.mean(combined_norms), np.std(combined_norms)),
@@ -192,7 +192,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--jsonl-path", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--seq-len", type=int, default=2048, help="Max length")
+    parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--patch-len", type=int, default=16)
     parser.add_argument("--patch-stride", type=int, default=8)
     parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-3.2-3B")
@@ -214,7 +214,7 @@ def main():
         llm_model_path=args.llm_model_path,
         llm_device_map=str(device),
         llm_dtype="bfloat16",
-        use_stats_projector=True,
+        # use_stats_projector=True (已移除)
     )
     
     print(f">>> Loading Model from {args.checkpoint}...")
@@ -224,7 +224,6 @@ def main():
         model.load_state_dict(checkpoint, strict=False)
     
     print(f">>> Loading Dataset...")
-    # ✨ 修改点 1：传入 patch_stride
     val_ds = ChatTSDataset(
         args.jsonl_path, 
         seq_len=args.seq_len, 
@@ -249,8 +248,7 @@ def main():
     print("-" * 70)
     print(f"Loss: {loss_metrics['loss']:.4f} | Perplexity: {loss_metrics['perplexity']:.4f} | Acc: {loss_metrics['accuracy']*100:.2f}%")
     print("-" * 70)
-    print(f"Implicit Stat Token Norm (Soft): {emb_metrics['stat_norm'][0]:.4f} ± {emb_metrics['stat_norm'][1]:.4f}")
-    print(f"Explicit Text Stat Norm (Hard):  {emb_metrics['text_stat_norm'][0]:.4f} ± {emb_metrics['text_stat_norm'][1]:.4f}  <-- ✨ New!")
+    print(f"Explicit Text Stat Norm (Hard):  {emb_metrics['text_stat_norm'][0]:.4f} ± {emb_metrics['text_stat_norm'][1]:.4f}")
     print(f"Query Token Norm:                {emb_metrics['query_norm'][0]:.4f} ± {emb_metrics['query_norm'][1]:.4f}")
     print(f"Detail Token Norm:               {emb_metrics['detail_norm'][0]:.4f} ± {emb_metrics['detail_norm'][1]:.4f}")
     print("="*70)

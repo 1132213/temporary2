@@ -16,9 +16,9 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="stat"
+LAST_MODEL="stat_film"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="stat"
+MODEL_SUFFIX="stat_film_encoder"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/sft/new_merged.jsonl"
 JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/my_data/sft.jsonl"
@@ -52,7 +52,6 @@ echo "Stage 2 权重: $STAGE2_CHECKPOINT"
 echo "=========================================="
 echo ""
 
-# 构建训练命令
 CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --master_port=29502 \
     train/train_chatts_instruct_ddp.py \
@@ -68,10 +67,30 @@ CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --epochs $EPOCHS \
     --num-workers 4 \
     --seed 42 \
-    --freeze-encoder \
     --use-lora \
     --lora-r 16 \
     --lora-alpha 32 "
+
+# 构建训练命令
+# CMD="torchrun --nproc_per_node=$NUM_GPUS \
+#     --master_port=29502 \
+#     train/train_chatts_instruct_ddp.py \
+#     --jsonl-path \"$JSONL_PATH\" \
+#     --stage2-checkpoint \"$STAGE2_CHECKPOINT\" \
+#     --llm-model-path \"$LLM_PATH\" \
+#     --seq-len $SEQ_LEN \
+#     --patch-len $PATCH_LEN \
+#     --patch-stride $PATCH_STRIDE \
+#     --batch-size $BATCH_SIZE \
+#     --gradient-accumulation-steps $GRADIENT_ACCUM \
+#     --lr $LR \
+#     --epochs $EPOCHS \
+#     --num-workers 4 \
+#     --seed 42 \
+#     --freeze-encoder \
+#     --use-lora \
+#     --lora-r 16 \
+#     --lora-alpha 32 "
 
 # 如果设置了模型后缀，添加参数
 if [ -n "$MODEL_SUFFIX" ]; then

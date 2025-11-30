@@ -214,7 +214,7 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         llm_device_map=f"cuda:{local_rank}",  # 每个进程使用自己的 GPU
         llm_dtype="bfloat16",
         freeze_patch_encoder=True,
-        use_stats_projector=True,
+        # use_stats_projector=True,
         epsilon=1e-5,
     )
     

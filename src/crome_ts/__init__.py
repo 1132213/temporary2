@@ -7,7 +7,8 @@ from .model import (
     PatchTSTEncoder,
     QFormer,
     CROMEAdapter,
-    StatProjector,
+    # StatProjector,  <-- 移除这个
+    RobustFiLMGenerator, # <-- 新增这个
     CROMETSModel,
     InstructionTokenizer,
     FrozenLLM,
@@ -19,10 +20,10 @@ __all__ = [
     "PatchTSTEncoder",
     "QFormer",
     "CROMEAdapter",
-    "StatProjector",
+    # "StatProjector", <-- 移除这个
+    "RobustFiLMGenerator", # <-- 新增这个
     "CROMETSModel",
     "InstructionTokenizer",
     "FrozenLLM",
     "StatBypassCROMETS1",
 ]
-
