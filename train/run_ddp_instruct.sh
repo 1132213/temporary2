@@ -16,21 +16,21 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="stat_film"
+LAST_MODEL="film_drop"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="stat_film_encoder"
+MODEL_SUFFIX="film_drop"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/sft/new_merged.jsonl"
-JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/my_data/sft.jsonl"
-STAGE2_CHECKPOINT="model/chatts_stage2_aligned_ddp_$LAST_MODEL.pth"
-LLM_PATH="/root/emhua/btwu/Qwen2.5-3B-Instruct"
+JSONL_PATH="/datadisk/hem/dataset/my_data/sft.jsonl"
+STAGE2_CHECKPOINT="model/aligned_$LAST_MODEL.pth"
+LLM_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-3B-Instruct"
  # 可选：模型名称后缀，例如设置为 "1st" 则保存为 chatts_instruct_best_ddp_1st.pth
 
 # 训练超参数
 BATCH_SIZE=1         # 每个GPU的批次大小
 GRADIENT_ACCUM=32      # 梯度累积步数
-EPOCHS=5
-LR=5e-5               # 微调阶段使用较小的学习率
+EPOCHS=4
+LR=2e-5               # 微调阶段使用较小的学习率
 SEQ_LEN=1024
 PATCH_LEN=16
 PATCH_STRIDE=16
@@ -54,7 +54,7 @@ echo ""
 
 CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --master_port=29502 \
-    train/train_chatts_instruct_ddp.py \
+    train/sft.py \
     --jsonl-path \"$JSONL_PATH\" \
     --stage2-checkpoint \"$STAGE2_CHECKPOINT\" \
     --llm-model-path \"$LLM_PATH\" \

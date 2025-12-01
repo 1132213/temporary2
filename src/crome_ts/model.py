@@ -15,7 +15,6 @@ class CROMEConfig:
     """
     全局配置。
     """
-
     input_channels: int
     llm_embed_dim: int
     patch_len: int = 16
@@ -26,13 +25,12 @@ class CROMEConfig:
     freeze_patch_encoder: bool = False
     query_tokens: int = 32
     adapter_hidden_dim: int = 256
-    fuse_mode: str = "add"  # or "concat"
+    fuse_mode: str = "add"
     epsilon: float = 1e-4
     # LLM 接口
     llm_model_path: str = "/root/emhua/btwu/Llama-2-7b-hf"
     llm_dtype: str = "bfloat16"
     llm_device_map: str = "auto"
-    # 注意：原本的 stat_fourier_features 等参数已废弃，保留是为了兼容旧Config加载
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -56,19 +54,46 @@ def get_llm_embed_dim(llm_model_path: str) -> int:
     except Exception as e:
         raise RuntimeError(f"加载模型配置失败: {e}。模型路径: {llm_model_path}")
 
-
 class RevIN(nn.Module):
-    """Reversible Instance Normalization。"""
     def __init__(self, eps: float = 1e-4):
         super().__init__()
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        mu = x.mean(dim=1, keepdim=True)
-        sigma = x.std(dim=1, keepdim=True).clamp_min(self.eps)
-        x_norm = (x - mu) / sigma
-        stats = torch.stack((mu.squeeze(1), sigma.squeeze(1)), dim=-1)
+        # 1. 备份原始数据类型 (如 bfloat16)
+        if x.dtype != torch.float32:
+            print(f"⚠️ WARNING: RevIN input is {x.dtype}! Precision lost before RevIN!")
+        orig_dtype = x.dtype
+        
+        # 2. 升格为 float32 进行统计量计算 (防止 100.24 被截断成 100.0)
+        x_fp32 = x.float()
+        
+        mu = x_fp32.mean(dim=1, keepdim=True)
+        sigma = x_fp32.std(dim=1, keepdim=True).clamp_min(self.eps)
+        
+        # 3. 归一化 (在 fp32 下做减法，避免大数吃小数)
+        x_norm = (x_fp32 - mu) / sigma
+        
+        # 4. 转回原始精度传给后续网络
+        x_norm = x_norm.to(dtype=orig_dtype)
+        
+        # stats 保持 fp32 精度或转回都可以，建议转回以匹配 FiLM 输入
+        stats = torch.stack((mu.squeeze(1), sigma.squeeze(1)), dim=-1).to(dtype=orig_dtype)
+        
         return x_norm, stats
+
+# class RevIN(nn.Module):
+#     """Reversible Instance Normalization。"""
+#     def __init__(self, eps: float = 1e-4):
+#         super().__init__()
+#         self.eps = eps
+
+#     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+#         mu = x.mean(dim=1, keepdim=True)
+#         sigma = x.std(dim=1, keepdim=True).clamp_min(self.eps)
+#         x_norm = (x - mu) / sigma
+#         stats = torch.stack((mu.squeeze(1), sigma.squeeze(1)), dim=-1)
+#         return x_norm, stats
 
 
 class FixedSinePositionalEncoding(nn.Module):
@@ -143,8 +168,10 @@ class PatchTSTEncoder(nn.Module):
     """模块 II：冻结 PatchTST 形态编码器。"""
     def __init__(self, config: CROMEConfig, input_dim: int):
         super().__init__()
+        # === 修复：保存 config 以避免 AttributeError ===
+        self.config = config 
+        # ==========================================
         self.embedding = PatchEmbedding(config, input_dim)
-        self.config=config
         layer = nn.TransformerEncoderLayer(
             d_model=config.patch_embedding_dim,
             nhead=config.patch_num_heads,
@@ -159,10 +186,6 @@ class PatchTSTEncoder(nn.Module):
             p.requires_grad_(False)
 
     def forward(self, x: Tensor) -> Tensor:
-        # 如果需要解冻，这里可以去掉 no_grad，但通常 encoder forward 逻辑简单
-        # 为了兼容性保持原状，外层训练脚本控制 requires_grad 即可
-        # 如果需要梯度回传，PatchTSTEncoder 内部不应该强制 no_grad
-        # 修正：根据 freeze_patch_encoder 决定是否启用 grad
         if self.config.freeze_patch_encoder:
             with torch.no_grad():
                 emb = self.embedding(x)
@@ -209,13 +232,14 @@ class RobustFiLMGenerator(nn.Module):
     """
     Robust Log-Space FiLM Generator.
     解决梯度冲突与尺度爆炸问题：
-    1. 独立于主干特征流，梯度不互通。
-    2. 使用对数变换预处理，适应不同量级的时间序列。
+    1. 独立于主干特征流。
+    2. 使用对数变换预处理。
     """
     def __init__(self, config: CROMEConfig):
         super().__init__()
-        # 输入特征：log_mu, log_sigma, sign_mu, cv
-        input_dim = 4
+        # === 修复点：输入特征改为 3 (log_mu, log_sigma, sign_mu) ===
+        # 移除了 CV (Coefficient of Variation)，因为它会导致 NaN
+        input_dim = 3
         
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, config.adapter_hidden_dim),
@@ -224,7 +248,7 @@ class RobustFiLMGenerator(nn.Module):
             nn.Linear(config.adapter_hidden_dim, config.adapter_hidden_dim * 2) # gamma, beta
         )
         
-        # 零初始化最后一层，使初始状态为恒等变换
+        # 零初始化
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
@@ -241,9 +265,10 @@ class RobustFiLMGenerator(nn.Module):
         log_mu = torch.log1p(mu.abs())
         log_sigma = torch.log1p(sigma)
         sign_mu = torch.sign(mu)
-        cv = mu / (sigma + 1e-5) # 变异系数特征
         
-        features = torch.cat([log_mu, log_sigma, sign_mu, cv], dim=-1)
+        # === 修复点：不再包含 cv 特征 ===
+        features = torch.cat([log_mu, log_sigma, sign_mu], dim=-1)
+        
         out = self.mlp(features)
         
         if out.dim() == 2:
@@ -288,10 +313,7 @@ class CROMEAdapter(nn.Module):
         beta: Optional[Tensor] = None
     ) -> Tensor:
         query_out = self.query_adapter(query_tokens)
-        
-        # 仅对 Detail Path 应用 FiLM
         patch_out = self.patch_adapter(patch_tokens, gamma=gamma, beta=beta)
-        
         return torch.cat([query_out, patch_out], dim=1)
 
 
@@ -351,10 +373,6 @@ class FrozenLLM(nn.Module):
 
 
 class CROMETSModel(nn.Module):
-    """
-    模块 V：CROME 主体模型 (FiLM Enhanced, No Stat Token)
-    """
-
     def __init__(self, config: CROMEConfig):
         super().__init__()
         self.config = config
@@ -366,13 +384,8 @@ class CROMETSModel(nn.Module):
         self.qformer = QFormer(config)
         self.detail_proj = DetailProjection(config)
         
-        # FiLM Generator
         self.film_generator = RobustFiLMGenerator(config)
-        
         self.adapter = CROMEAdapter(config)
-        
-        # 移除 StatProjector
-        # self.stat_projector = StatProjector(config)
         
         self.llm_proj = nn.Linear(config.patch_embedding_dim, config.llm_embed_dim)
 
@@ -381,19 +394,13 @@ class CROMETSModel(nn.Module):
         channel_data: Tensor,
         instruction_embeds: Optional[Tensor] = None,
     ) -> Tensor:
-        """
-        处理单通道数据，仅返回 ts_tokens (stat token 已移除)
-        """
         x, stats = self.preprocessor(channel_data)
-        
-        # 生成 FiLM 参数
         gamma, beta = self.film_generator(stats)
         
         patch_tokens = self.shape_encoder(x)
         query_tokens = self.qformer(patch_tokens, instruction_embeds)
         detail_tokens = self.detail_proj(patch_tokens)
         
-        # FiLM 调制与融合
         ts_tokens = self.adapter(query_tokens, detail_tokens, gamma=gamma, beta=beta)
         ts_tokens = self.llm_proj(ts_tokens)
         
@@ -407,7 +414,6 @@ class CROMETSModel(nn.Module):
         instruction_embeds: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         target_dtype = text_prefix.dtype
-        
         x, stats = self.preprocessor(raw_series)
         gamma, beta = self.film_generator(stats)
         
@@ -421,7 +427,6 @@ class CROMETSModel(nn.Module):
         if ts_tokens.dtype != target_dtype:
             ts_tokens = ts_tokens.to(dtype=target_dtype)
             
-        # 拼接：移除 stat_token
         assembled = torch.cat(
             [text_prefix, ts_tokens, text_suffix],
             dim=1,
@@ -433,10 +438,6 @@ class CROMETSModel(nn.Module):
 
 
 class StatBypassCROMETS1(nn.Module):
-    """
-    端到端系统封装：支持 ChatTS 格式与 Text Stats Dropout
-    """
-
     def __init__(self, config: CROMEConfig):
         super().__init__()
         self.config = config
@@ -505,7 +506,6 @@ class StatBypassCROMETS1(nn.Module):
             
             target_dtype = next(self.llm.parameters()).dtype
             
-            # Prefix
             if text_parts[0]:
                 prefix_encoded = self.tokenizer([text_parts[0]], device)
                 prefix_embed = self.llm.embed(prefix_encoded["input_ids"])
@@ -518,7 +518,6 @@ class StatBypassCROMETS1(nn.Module):
             
             prefix_mask_lengths.append(prefix_length)
             
-            # Process Time Series
             for ts_idx, ts_tensor in enumerate(timeseries_list):
                 ts_tensor = ts_tensor.to(device)
                 
@@ -531,7 +530,6 @@ class StatBypassCROMETS1(nn.Module):
                     ts_mean = ts_std = ts_min = ts_max = 0.0
                 
                 # === Text Stats Dropout ===
-                # 训练时 50% 概率丢弃统计量文本
                 if self.training and torch.rand(1).item() < 0.5:
                     stats_str = ""
                 else:
@@ -546,7 +544,6 @@ class StatBypassCROMETS1(nn.Module):
                 
                 ts_batch = ts_tensor.unsqueeze(0)
                 
-                # 获取 TS Tokens (无 stat token)
                 ts_tokens = self.ts_model._process_single_channel(
                     ts_batch, instruction_embeds=None
                 )
@@ -554,7 +551,6 @@ class StatBypassCROMETS1(nn.Module):
                 if ts_tokens.dtype != target_dtype:
                     ts_tokens = ts_tokens.to(dtype=target_dtype)
                 
-                # 拼接：直接使用 ts_tokens
                 ts_embed = ts_tokens[0]
                 
                 segment_embeds.append(ts_embed)
@@ -567,7 +563,6 @@ class StatBypassCROMETS1(nn.Module):
                     segment_embeds.append(sep_embed)
                     segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
                 
-                # Middle Text
                 text_idx = ts_idx + 1
                 if text_idx < len(text_parts) and text_parts[text_idx]:
                     text_encoded = self.tokenizer([text_parts[text_idx]], device)
@@ -576,7 +571,6 @@ class StatBypassCROMETS1(nn.Module):
                     segment_embeds.append(text_embed[0])
                     segment_masks.append(text_mask[0])
             
-            # Suffix
             if output_text:
                 suffix_encoded = self.tokenizer([output_text], device)
                 suffix_embed = self.llm.embed(suffix_encoded["input_ids"])
@@ -595,7 +589,6 @@ class StatBypassCROMETS1(nn.Module):
             assembled_embeds_list.append(full_embed)
             attention_masks_list.append(full_mask)
         
-        # Batch Padding
         max_len = max(emb.shape[0] for emb in assembled_embeds_list)
         embed_dim = assembled_embeds_list[0].shape[1]
         
@@ -655,7 +648,6 @@ class StatBypassCROMETS1(nn.Module):
             device=device,
             dtype=prefix_mask.dtype,
         )
-        # 移除 stat_token 对应的 mask (ones)
         attention_mask = torch.cat(
             [prefix_mask, ts_mask, suffix_mask],
             dim=1,

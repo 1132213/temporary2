@@ -19,19 +19,21 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="nonoverlap"
+LAST_MODEL=""
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="stat_newfilm_drop"
+MODEL_SUFFIX=""
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned_2w.jsonl"
-JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/my_data/alignment.jsonl"
-PRETRAINED_PATH="model/patchtst_pretrained_full_$LAST_MODEL.pth"
-LLM_PATH="/root/emhua/btwu/Qwen2.5-3B-Instruct"
+JSONL_PATH="/datadisk/hem/dataset/my_data/alignment.jsonl"
+PRETRAINED_PATH="model/encoder.pth"
+# PRETRAINED_PATH="model/encoder_$LAST_MODEL.pth"
+LLM_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-3B-Instruct"
+# LLM_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-7B-Instruct"
 
 # 训练超参数
 BATCH_SIZE=2          # 每个GPU的批次大小
 GRAD_ACCUM=16          # 梯度累积步数
-EPOCHS=5
+EPOCHS=4
 LR=1e-3
 SEQ_LEN=1024
 PATCH_LEN=16
@@ -56,7 +58,7 @@ echo ""
 # 构建训练命令
 CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --master_port=29501 \
-    train/train_chatts_alignment_ddp.py \
+    train/alignment.py \
     --jsonl-path \"$JSONL_PATH\" \
     --pretrained-encoder-path \"$PRETRAINED_PATH\" \
     --llm-model-path \"$LLM_PATH\" \

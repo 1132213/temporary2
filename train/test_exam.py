@@ -58,7 +58,7 @@ def exam_collate_fn(batch):
     return batch_dict
 
 # ==========================================
-# 2. Embedding 构建 (修复版：适配 FiLM, No Stat Token)
+# 2. Embedding 构建 (保持不变)
 # ==========================================
 def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
     ts_marker = "<ts><ts/>"
@@ -86,7 +86,7 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
     for idx, ts in enumerate(timeseries_list):
         ts = ts.to(device)
         
-        # --- 显式统计量文本 (必须保留，不 Dropout) ---
+        # --- 显式统计量文本 ---
         if ts.numel() > 0:
             ts_mean = ts.mean().item()
             ts_std = ts.std().item()
@@ -97,19 +97,15 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
             
         stats_str = f" [Stats: mean={ts_mean:.2f}, std={ts_std:.2f}, min={ts_min:.2f}, max={ts_max:.2f}] "
         
-        stats_tokens = tokenizer(stats_str, return_tensors="pt", add_special_tokens=False).to(device)
-        segment_embeds.append(model.llm.embed(stats_tokens.input_ids)[0])
-        segment_masks.append(stats_tokens.attention_mask[0])
+        # stats_tokens = tokenizer(stats_str, return_tensors="pt", add_special_tokens=False).to(device)
+        # segment_embeds.append(model.llm.embed(stats_tokens.input_ids)[0])
+        # segment_masks.append(stats_tokens.attention_mask[0])
         
         ts_batch = ts.unsqueeze(0)
-        
-        # === 修复核心：_process_single_channel 只返回 ts_tokens ===
-        # stat_token 已被移除
         ts_tokens = model.ts_model._process_single_channel(ts_batch)
         
         if ts_tokens.dtype != target_dtype: ts_tokens = ts_tokens.to(dtype=target_dtype)
 
-        # === 修复核心：直接使用 ts_tokens，不再拼接 stat_token ===
         ts_emb = ts_tokens[0]
         
         segment_embeds.append(ts_emb)
@@ -203,7 +199,101 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
     with open(temp_file, 'w', encoding='utf-8') as f:
         for res in results: f.write(json.dumps(res, ensure_ascii=False) + "\n")
 
-# ... (后续 Judge 逻辑保持不变)
+# ==========================================
+# 4. 正则表达式判断逻辑 (替代 AI Judge)
+# ==========================================
+def extract_answer_option(text):
+    """
+    从文本中提取选项字母 (A, B, C, D)。
+    策略：
+    1. 优先匹配行首或字符串开头的单个字母。
+    2. 其次匹配 'Answer: A' 或 'Option A' 等模式。
+    3. 最后查找任何独立的 A-D 字符，取第一个。
+    """
+    if not text:
+        return "None"
+    
+    text = text.strip().upper()
+    
+    # 1. 严格匹配开头 (例如 "A", "A.", "A)", "A:")
+    match = re.match(r'^([A-D])([.,:;)]|$)', text)
+    if match:
+        return match.group(1)
+        
+    # 2. 匹配 "Answer is A", "Option: B" 等
+    match = re.search(r'(?:ANSWER|OPTION|CHOICE)\s*[:\-\s]*([A-D])\b', text)
+    if match:
+        return match.group(1)
+        
+    # 3. 最后的保底：查找文本中第一个出现的独立 A-D 字符
+    # \b 确保不是单词的一部分
+    matches = re.findall(r'\b([A-D])\b', text)
+    if matches:
+        return matches[0]
+        
+    return "None"
+
+def evaluate_exam_results_with_regex(results_list):
+    total_stats = {"correct": 0, "total": 0}
+    cat_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+    
+    print(f"\n>>> Starting Regex Evaluation on {len(results_list)} samples...")
+    for i, item in enumerate(tqdm(results_list, desc="Regex Judging")):
+        gt = item.get("ground_truth", "").strip()
+        pred = item.get("prediction", "").strip()
+        cat = item.get("category", "Uncategorized")
+        
+        gt_opt = extract_answer_option(gt)
+        pred_opt = extract_answer_option(pred)
+        
+        is_correct_val = 1 if (gt_opt != "None" and gt_opt == pred_opt) else 0
+        
+        item["judge_score"] = is_correct_val
+        item["judge_type"] = "regex"
+        item["extracted_gt"] = gt_opt
+        item["extracted_pred"] = pred_opt
+        
+        total_stats["total"] += 1
+        cat_stats[cat]["total"] += 1
+        if is_correct_val == 1:
+            total_stats["correct"] += 1
+            cat_stats[cat]["correct"] += 1
+
+    print(f"\n{'='*25} Regex Judge Report {'='*25}")
+    print(f"{'Category':<35} | {'Acc':<8} | {'Correct':<8} | {'Total':<8}")
+    print("-" * 75)
+
+    forced_order = [
+        "Pattern Recognition",
+        "Noise Understanding",
+        "Anomaly Detection", 
+        "Similarity Analysis",
+        "Causality Analysis"
+    ]
+    
+    printed_categories = set()
+    for cat in forced_order:
+        target_key = cat
+        if cat not in cat_stats and "Anolmaly Detection" in cat_stats and cat == "Anomaly Detection":
+            target_key = "Anolmaly Detection"
+
+        if target_key in cat_stats:
+            s = cat_stats[target_key]
+            acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
+            print(f"{target_key:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
+            printed_categories.add(target_key)
+    
+    remaining_cats = sorted([c for c in cat_stats.keys() if c not in printed_categories])
+    for cat in remaining_cats:
+        s = cat_stats[cat]
+        acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
+        print(f"{cat:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
+
+    print("-" * 75)
+    total_acc = (total_stats['correct'] / total_stats['total']) * 100 if total_stats['total'] > 0 else 0.0
+    print(f"{'OVERALL':<35} | {total_acc:<7.2f}% | {total_stats['correct']:<8} | {total_stats['total']:<8}")
+    print("=" * 75 + "\n")
+    return results_list
 
 # ==========================================
 # 5. 主程序
@@ -219,7 +309,7 @@ def cleanup_distributed():
     if dist.is_initialized(): dist.destroy_process_group()
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Stage 3 (ChatTS Instruct) - Multi GPU with External AI Judge")
+    parser = argparse.ArgumentParser(description="Test Stage 3 (ChatTS Instruct) - Multi GPU with Regex Judge")
     parser.add_argument("--jsonl-path", type=str, default="chatts_data.jsonl")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output-file", type=str, default="chatts_stage3_test_results.jsonl")
@@ -227,7 +317,7 @@ def main():
     parser.add_argument("--patch-len", type=int, default=16)
     parser.add_argument("--patch-stride", type=int, default=8)
     parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-3.2-3B")
-    parser.add_argument("--judge-model-path", type=str, required=True, help="Path to the external AI Judge model")
+    # parser.add_argument("--judge-model-path", type=str, required=True) # 已移除
     parser.add_argument("--calc-loss", action="store_true")
     parser.add_argument("--num-gen-samples", type=int, default=100)
     parser.add_argument("--use-lora", action="store_true")
@@ -248,7 +338,6 @@ def main():
         llm_model_path=args.llm_model_path,
         llm_device_map=f"cuda:{local_rank}",
         llm_dtype="bfloat16",
-        # use_stats_projector=True (已废弃)
     )
     model = StatBypassCROMETS1(config).to(device)
     
@@ -271,7 +360,8 @@ def main():
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=False)
     loader = DataLoader(ds, batch_size=1, sampler=sampler, collate_fn=exam_collate_fn)
     
-    max_samples = (args.num_gen-samples + world_size - 1) // world_size if args.num_gen_samples > 0 else None
+    # 修复了这里的拼写错误 (num-gen-samples -> num_gen_samples)
+    max_samples = (args.num_gen_samples + world_size - 1) // world_size if args.num_gen_samples > 0 else None
     if args.num_gen_samples == -1: max_samples = None
 
     generate_predictions(model, loader, device, args.output_file, rank, max_samples)
@@ -280,8 +370,23 @@ def main():
     
     # Phase 2: Evaluation
     if rank == 0:
-        # ... (合并逻辑不变)
-        pass # 请保留原文件的合并逻辑
+        print(f">>> Merging results from all {world_size} ranks...")
+        merged_results = []
+        for r in range(world_size):
+            fname = f"{args.output_file}.rank{r}"
+            if os.path.exists(fname):
+                with open(fname, 'r', encoding='utf-8') as f:
+                    merged_results.extend([json.loads(line) for line in f])
+                os.remove(fname)
+        
+        print(f">>> Total Samples Generated: {len(merged_results)}")
+        
+        # 使用正则评估
+        final_scored_results = evaluate_exam_results_with_regex(merged_results)
+        
+        with open(args.output_file, 'w', encoding='utf-8') as f:
+            for item in final_scored_results: f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        print(f">>> Final results saved to {args.output_file}")
         
     cleanup_distributed()
 
