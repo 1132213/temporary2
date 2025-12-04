@@ -16,21 +16,21 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="film_drop"
+LAST_MODEL="7b_raw_16"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="film_drop"
+MODEL_SUFFIX="7b_raw_16"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/sft/new_merged.jsonl"
 JSONL_PATH="/datadisk/hem/dataset/my_data/sft.jsonl"
 STAGE2_CHECKPOINT="model/aligned_$LAST_MODEL.pth"
-LLM_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-3B-Instruct"
+LLM_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-7B-Instruct"
  # 可选：模型名称后缀，例如设置为 "1st" 则保存为 chatts_instruct_best_ddp_1st.pth
 
 # 训练超参数
 BATCH_SIZE=1         # 每个GPU的批次大小
 GRADIENT_ACCUM=32      # 梯度累积步数
 EPOCHS=4
-LR=2e-5               # 微调阶段使用较小的学习率
+LR=1e-4               # 微调阶段使用较小的学习率
 SEQ_LEN=1024
 PATCH_LEN=16
 PATCH_STRIDE=16
@@ -67,9 +67,10 @@ CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --epochs $EPOCHS \
     --num-workers 4 \
     --seed 42 \
+    --save-only-trainable \
     --use-lora \
-    --lora-r 16 \
-    --lora-alpha 32 "
+    --lora-r 32 \
+    --lora-alpha 64 "
 
 # 构建训练命令
 # CMD="torchrun --nproc_per_node=$NUM_GPUS \

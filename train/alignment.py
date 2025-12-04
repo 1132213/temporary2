@@ -35,7 +35,7 @@ import logging
 from datetime import datetime
 import math
 import subprocess  # <--- [新增] 引入 subprocess
-
+from transformers import get_cosine_schedule_with_warmup
 def setup_distributed():
     """初始化分布式训练环境"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -297,11 +297,32 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         collate_fn=chatts_collate_fn, num_workers=args.num_workers, drop_last=True, pin_memory=True
     )
     
-    steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
-    scheduler = OneCycleLR(
-        optimizer, max_lr=args.lr, steps_per_epoch=steps_per_epoch, epochs=args.epochs, pct_start=0.1, div_factor=25.0
-    )
+    # steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+    # scheduler = OneCycleLR(
+    #     optimizer, max_lr=args.lr, steps_per_epoch=steps_per_epoch, epochs=args.epochs, pct_start=0.1, div_factor=25.0
+    # )
+
+
+    # 1. 计算总优化步数 (Total Training Steps)
+    # len(train_loader) 是总 Batch 数，除以梯度累积步数才是 Optimizer 实际更新的次数
+    num_update_steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+    max_train_steps = args.epochs * num_update_steps_per_epoch
     
+    # 2. 计算预热步数 (Warmup Steps)
+    # 复刻参考脚本的 warmup_ratio = 0.02
+    warmup_steps = int(max_train_steps * 0.02)
+    if rank == 0:
+        logger.info(f">>> Scheduler: Cosine with Warmup")
+        logger.info(f">>> Total Optimization Steps: {max_train_steps}")
+        logger.info(f">>> Warmup Steps: {warmup_steps} (Ratio: 0.02)")
+
+    # 3. 初始化调度器
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_train_steps
+    )
+
     # 6. 训练循环
     best_val_loss = float("inf")
     accumulation_steps = args.gradient_accumulation_steps
@@ -365,9 +386,9 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         if rank == 0 and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             if args.model_suffix:
-                model_filename = f"chatts_stage2_aligned_ddp_{args.model_suffix}.pth"
+                model_filename = f"aligned_{args.model_suffix}.pth"
             else:
-                model_filename = "chatts_stage2_aligned_ddp.pth"
+                model_filename = "aligned.pth"
             save_path = model_dir / model_filename
             
             model_to_save = model.module if isinstance(model, DDP) else model
@@ -382,38 +403,47 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
             # =================================================================
             # ✨ 核心修复：单卡独立子进程评测
             # =================================================================
-            if args.eval_jsonl_path and args.judge_model_path:
-                logger.info(f">>> [Auto-Eval] Triggering evaluation for Epoch {epoch+1}...")
-                eval_log_name = f"eval_result_epoch{epoch+1}_{args.model_suffix}.jsonl"
-                eval_output_path = project_root / "log" / eval_log_name
+            # if args.eval_jsonl_path:
+            #     logger.info(f">>> [Auto-Eval] Triggering evaluation for Epoch {epoch+1}...")
+            #     eval_log_name = f"eval_result_epoch{epoch+1}_{args.model_suffix}.jsonl"
+            #     eval_output_path = project_root / "log" / eval_log_name
                 
-                cmd = [
-                    sys.executable, "train/test_exam_stage2.py",
-                    "--jsonl-path", args.eval_jsonl_path,
-                    "--checkpoint", str(save_path),
-                    "--output-file", str(eval_output_path),
-                    "--llm-model-path", args.llm_model_path,
-                    "--seq-len", str(args.seq_len),
-                    "--patch-len", str(args.patch_len),
-                    "--patch-stride", str(args.patch_stride),
-                    "--num-gen-samples", str(args.eval_num_samples),
-                ]
+            #     cmd = [
+            #         sys.executable, "train/test_exam_stage2.py",
+            #         "--jsonl-path", args.eval_jsonl_path,
+            #         "--checkpoint", str(save_path),
+            #         "--output-file", str(eval_output_path),
+            #         "--llm-model-path", args.llm_model_path,
+            #         "--seq-len", str(args.seq_len),
+            #         "--patch-len", str(args.patch_len),
+            #         "--patch-stride", str(args.patch_stride),
+            #         "--num-gen-samples", str(args.eval_num_samples),
+            #     ]
                 
-                try:
-                    # ✨ 关键修复：清洗环境变量，移除 DDP 相关配置
-                    # 这样 test_exam_stage2.py 就会以单机单卡模式运行，不会死锁
-                    clean_env = os.environ.copy()
-                    for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"]:
-                        clean_env.pop(key, None)
+            #     try:
+            #         clean_env = os.environ.copy()
+            #         for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"]:
+            #             clean_env.pop(key, None)
                     
-                    # 限制子进程只能看到 Rank 0 的显卡（防止 OOM 或干扰）
-                    # 注意：如果显存不够，这里会 OOM。确保 eval batch size 极小。
-                    clean_env["CUDA_VISIBLE_DEVICES"] = str(local_rank)
+            #         result = subprocess.run(
+            #             cmd, 
+            #             env=clean_env, 
+            #             capture_output=True, 
+            #             text=True
+            #         )
                     
-                    subprocess.Popen(cmd, env=clean_env)
-                    logger.info(f">>> [Auto-Eval] Process started. Output: {eval_output_path}")
-                except Exception as e:
-                    logger.error(f">>> [Auto-Eval] Failed to launch evaluation: {e}")
+            #         if result.returncode == 0:
+            #             logger.info(">>> [Auto-Eval] Finished successfully.")
+            #             # 将评测结果表格打印到主日志中
+            #             logger.info("\n" + "="*30 + f" EVAL REPORT (Epoch {epoch+1}) " + "="*30)
+            #             logger.info(result.stdout)
+            #             logger.info("="*80)
+            #         else:
+            #             logger.error(f">>> [Auto-Eval] Failed with return code {result.returncode}")
+            #             logger.error(f"Stderr: {result.stderr}")
+                        
+            #     except Exception as e:
+            #         logger.error(f">>> [Auto-Eval] Exception launching evaluation: {e}")
             # =================================================================
         
         if dist.is_initialized():

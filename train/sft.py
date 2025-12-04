@@ -25,6 +25,7 @@ from datetime import datetime
 import math
 import os
 import subprocess  # <--- [新增] 引入 subprocess
+from transformers import get_cosine_schedule_with_warmup
 
 # === 新增：PEFT 库 ===
 try:
@@ -261,9 +262,9 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         for p in model.ts_model.shape_encoder.parameters():
             p.requires_grad = True
     
-    if not args.use_lora:
-        for p in model.llm.parameters():
-            p.requires_grad = False
+    # if not args.use_lora:
+    #     for p in model.llm.parameters():
+    #         p.requires_grad = False
     
     # 5. DDP
     if world_size > 1:
@@ -351,9 +352,23 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         collate_fn=chatts_collate_fn, num_workers=args.num_workers, pin_memory=True
     )
     
-    steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
-    scheduler = OneCycleLR(
-        optimizer, max_lr=args.lr, steps_per_epoch=steps_per_epoch, epochs=args.epochs, pct_start=0.1, div_factor=25.0
+    # 1. 计算总优化步数
+    num_update_steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+    max_train_steps = args.epochs * num_update_steps_per_epoch
+    
+    # 2. 计算预热步数 (Warmup Ratio = 0.02)
+    warmup_steps = int(max_train_steps * 0.02)
+    
+    if rank == 0:
+        logger.info(f">>> Scheduler: Cosine with Warmup")
+        logger.info(f">>> Total Optimization Steps: {max_train_steps}")
+        logger.info(f">>> Warmup Steps: {warmup_steps} (Ratio: 0.02)")
+
+    # 3. 初始化调度器
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_train_steps
     )
     
     # 7. 训练循环

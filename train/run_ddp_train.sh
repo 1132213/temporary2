@@ -19,21 +19,21 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL=""
+LAST_MODEL="16"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX=""
+MODEL_SUFFIX="3b_raw_16_cos"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned_2w.jsonl"
 JSONL_PATH="/datadisk/hem/dataset/my_data/alignment.jsonl"
-PRETRAINED_PATH="model/encoder.pth"
-# PRETRAINED_PATH="model/encoder_$LAST_MODEL.pth"
+# PRETRAINED_PATH="model/encoder.pth"
+PRETRAINED_PATH="model/encoder_$LAST_MODEL.pth"
 LLM_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-3B-Instruct"
 # LLM_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-7B-Instruct"
 
 # 训练超参数
 BATCH_SIZE=2          # 每个GPU的批次大小
 GRAD_ACCUM=16          # 梯度累积步数
-EPOCHS=4
+EPOCHS=3
 LR=1e-3
 SEQ_LEN=1024
 PATCH_LEN=16
