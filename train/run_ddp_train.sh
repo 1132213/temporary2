@@ -19,23 +19,26 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="nonoverlap"
+LAST_MODEL="8"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="stat_newfilm_drop"
+MODEL_SUFFIX="7b_tattn_8"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned_2w.jsonl"
-JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/my_data/alignment.jsonl"
-PRETRAINED_PATH="model/patchtst_pretrained_full_$LAST_MODEL.pth"
-LLM_PATH="/root/emhua/btwu/Qwen2.5-3B-Instruct"
+JSONL_PATH="/mnt/shared-storage-user/huaermo/code/test_wbt2/alignment.jsonl"
+# PRETRAINED_PATH="model/encoder.pth"
+PRETRAINED_PATH="model/encoder_$LAST_MODEL.pth"
+# LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-3B-Instruct"
+LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-7B-Instruct"
 
 # 训练超参数
 BATCH_SIZE=2          # 每个GPU的批次大小
 GRAD_ACCUM=16          # 梯度累积步数
-EPOCHS=5
-LR=1e-3
+EPOCHS=3
+LR=5e-4
 SEQ_LEN=1024
-PATCH_LEN=16
-PATCH_STRIDE=16
+PATCH_LEN=8
+PATCH_STRIDE=8
+WEIGHT_DECAY=0.01
 # PATCH_STRIDE=8
 
 # 计算有效批次大小
@@ -56,7 +59,7 @@ echo ""
 # 构建训练命令
 CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --master_port=29501 \
-    train/train_chatts_alignment_ddp.py \
+    train/alignment.py \
     --jsonl-path \"$JSONL_PATH\" \
     --pretrained-encoder-path \"$PRETRAINED_PATH\" \
     --llm-model-path \"$LLM_PATH\" \
@@ -65,6 +68,7 @@ CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --patch-stride $PATCH_STRIDE \
     --batch-size $BATCH_SIZE \
     --gradient-accumulation-steps $GRAD_ACCUM \
+    --weight-decay $WEIGHT_DECAY \
     --lr $LR \
     --epochs $EPOCHS \
     --num-workers 4 \

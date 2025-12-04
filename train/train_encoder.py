@@ -222,9 +222,9 @@ def train_encoder(args):
     
     # 权重保存路径（使用之前定义的model_dir，支持自定义后缀）
     if args.model_suffix:
-        model_filename = f"patchtst_pretrained_full_{args.model_suffix}.pth"
+        model_filename = f"encoder_{args.model_suffix}.pth"
     else:
-        model_filename = "patchtst_pretrained_full.pth"
+        model_filename = "encoder.pth"
     best_save_path = model_dir / model_filename
     
     for epoch in range(args.epochs):

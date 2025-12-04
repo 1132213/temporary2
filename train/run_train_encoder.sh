@@ -7,13 +7,13 @@
 # ==================== 配置参数 ====================
 
 # 数据文件路径
-JSONL_PATH="/root/emhua/btwu/CROME2/data/gifteval_windows1.jsonl"
+JSONL_PATH="/datadisk/hem/dataset/merge.jsonl"
 
 # LLM 模型路径（用于获取 embed_dim）
-LLM_MODEL_PATH="/root/emhua/btwu/Llama-3.2-3B"
+LLM_MODEL_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-3B-Instruct"
 
 # 序列长度
-SEQ_LEN=256
+SEQ_LEN=1024
 
 # 训练参数
 BATCH_SIZE=128
@@ -32,7 +32,7 @@ INPUT_CHANNELS=1
 
 # GPU 设置
 DEVICE="cuda"
-GPU_ID=0
+GPU_ID=1
 
 # 模型名称后缀（可选）
 MODEL_SUFFIX="p8"  # 可选：模型名称后缀，例如设置为 "1st" 则保存为 patchtst_pretrained_full_1st.pth

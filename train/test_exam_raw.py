@@ -3,6 +3,7 @@ import json
 import argparse
 import torch
 import os
+import re
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -51,7 +52,7 @@ def exam_collate_fn(batch):
     return batch_dict
 
 # ==========================================
-# 2. 核心：将时序数据转换为文本字符串
+# 2. 核心：将时序数据转换为文本字符串 (保持不变)
 # ==========================================
 def serialize_timeseries_to_text(input_text, ts_list):
     """
@@ -72,8 +73,7 @@ def serialize_timeseries_to_text(input_text, ts_list):
             # 转为 numpy 并展平
             vals = ts_tensor.flatten().cpu().numpy()
             
-            # 为了防止 Prompt 过长，可以进行降采样或截断 (这里保留最多 256 个点作为示例)
-            # 如果原始 LLM 上下文足够长 (如 Llama 3 的 8k/128k)，可以保留更多
+            # 为了防止 Prompt 过长，可以进行降采样或截断
             max_points = 256 
             if len(vals) > max_points:
                 # 简单均匀采样
@@ -86,8 +86,7 @@ def serialize_timeseries_to_text(input_text, ts_list):
             
             result_text += ts_text_repr + parts[i+1]
     
-    # 如果文本还没拼完（比如 ts 比 marker 少），把剩下的拼上
-    # 通常 dataset 保证了数量匹配，这里做个兜底
+    # 兜底拼接
     if len(ts_list) < len(parts) - 1:
         for k in range(len(ts_list), len(parts)-1):
             result_text += " [Missing Series] " + parts[k+1]
@@ -95,9 +94,9 @@ def serialize_timeseries_to_text(input_text, ts_list):
     return result_text
 
 # ==========================================
-# 3. 推理生成 (使用 Raw LLM)
+# 3. 推理生成 (使用 Raw LLM，Prompt 与 test_exam.py 对齐)
 # ==========================================
-def generate_predictions_raw(model, tokenizer, dataloader, device, output_file, rank, max_samples=None):
+def generate_predictions_raw(model, tokenizer, dataloader, device, output_file, rank, max_samples=None, enable_cot=False):
     model.eval()
     results = []
     
@@ -123,28 +122,28 @@ def generate_predictions_raw(model, tokenizer, dataloader, device, output_file, 
                 raw_input = input_texts[i]
                 text_with_ts = serialize_timeseries_to_text(raw_input, ts_lists[i])
                 
-                # 2. 构建 Prompt (使用 Chat Template)
-                messages = [
-                    {"role": "user", "content": text_with_ts}
-                ]
-                
-                try:
-                    # 尝试应用 Chat Template
-                    text_prompt = tokenizer.apply_chat_template(
-                        messages, 
-                        tokenize=False, 
-                        add_generation_prompt=True
-                    )
-                except Exception:
-                    # 如果模型没有 template (base model)，回退到简单拼接
-                    text_prompt = f"User: {text_with_ts}\nAssistant:"
+                # 2. Prompt 构造 (与 test_exam.py 逻辑对齐)
+                if enable_cot:
+                    # 策略 A: CoT 模式 (先分析，后输出)
+                    cot_suffix = "\nLet's analyze step by step. At the end, state the answer as 'The answer is <Option>'."
+                    # 注意：手动构造 ChatML 格式以保持严格对齐
+                    full_input = f"<|im_start|>user\n{text_with_ts}{cot_suffix}<|im_end|>\n<|im_start|>assistant\n"
+                    
+                    max_new_tokens = 512
+                    stop_prefix = None
+                else:
+                    # 策略 B: Direct 模式 (强制输出)
+                    full_input = f"<|im_start|>user\n{text_with_ts}<|im_end|>\n<|im_start|>assistant\nThe answer is option"
+                    
+                    max_new_tokens = 16
+                    stop_prefix = "The answer is option" 
 
-                inputs = tokenizer(text_prompt, return_tensors="pt").to(device)
+                inputs = tokenizer(full_input, return_tensors="pt").to(device)
                 
                 try:
                     outs = model.generate(
                         **inputs,
-                        max_new_tokens=128, 
+                        max_new_tokens=max_new_tokens, 
                         min_new_tokens=1,   
                         do_sample=False,
                         repetition_penalty=1.1,
@@ -153,14 +152,30 @@ def generate_predictions_raw(model, tokenizer, dataloader, device, output_file, 
                     )
                     
                     # 解码并提取新生成的 token
+                    # inputs.input_ids.shape[1] 是输入的长度，只解码后面生成的部分
                     generated_ids = outs[0][inputs.input_ids.shape[1]:]
-                    pred = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    pred = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                    
+                    # --- 后处理 (与 test_exam.py 保持一致) ---
+                    # 1. 移除特殊标记 (尽管 decode skip_special_tokens 已处理大部分，但防止残留)
+                    stop_words = ["<|im_end|>", "<|im_start|>", "user", "model"]
+                    for stop_word in stop_words:
+                        idx = pred.find(stop_word)
+                        if idx != -1:
+                            pred = pred[:idx]
+                    
+                    # 2. 清理 Direct 模式下可能产生的重复前缀 (Raw LLM 生成通常不包含 Prompt，但为了保险)
+                    if stop_prefix and stop_prefix in pred:
+                        pred = pred.split(stop_prefix)[-1]
+                        
+                    pred = pred.strip()
                     
                     results.append({
                         "ground_truth": gts[i],
                         "prediction": pred,
                         "category": cats[i],
-                        "full_input_text": raw_input # 保留原始含标记的文本方便回顾
+                        "full_input_text": full_input, # 记录实际输入
+                        "mode": "cot" if enable_cot else "direct"
                     })
                     sample_count += 1
                 except Exception as e:
@@ -172,59 +187,65 @@ def generate_predictions_raw(model, tokenizer, dataloader, device, output_file, 
         for res in results: f.write(json.dumps(res, ensure_ascii=False) + "\n")
 
 # ==========================================
-# 4. AI 裁判逻辑 (保持不变)
+# 4. 正则表达式判断逻辑 (同步 test_exam.py 的增强版)
 # ==========================================
-def run_ai_judge(model, tokenizer, input_text, gt, pred, device):
-    clean_input = input_text.replace("<ts><ts/>", "").strip()
-    prompt = (
-        "You are an exam grader.\n"
-        "Your task is to determine if the Candidate's Prediction matches the Ground Truth for the given Question.\n\n"
-        f"--- Question & Options ---\n{clean_input}\n\n"
-        f"--- Ground Truth ---\n{gt}\n\n"
-        f"--- Candidate Prediction ---\n{pred}\n\n"
-        "Question: Is the Candidate Prediction correct? \n"
-        "The prediction is correct if it matches the Ground Truth option (e.g., A, B, C, D) or meaning.\n"
-        "Output ONLY '1' for Correct or '0' for Incorrect.\n"
-        "Answer:"
-    )
+def extract_answer_option(text):
+    """
+    从文本中提取选项字母 (A, B, C, D)。
+    与 test_exam.py 保持一致，增强 CoT 提取能力。
+    """
+    if not text:
+        return "None"
     
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            inputs.input_ids,
-            max_new_tokens=5,
-            do_sample=False,
-            temperature=0.0,
-            pad_token_id=tokenizer.pad_token_id
-        )
-    judge_output = tokenizer.decode(output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+    text = text.strip()
     
-    if "1" in judge_output: return 1
-    elif "0" in judge_output: return 0
-    else:
-        if gt.strip().upper() in pred.strip().upper(): return 1
-        return 0
+    # 策略 1: 查找 "The answer is X" 模式 (CoT 常用)
+    # 使用 IGNORECASE
+    match = re.search(r'The answer is\s*[:\-\s]*([A-D])', text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+        
+    # 策略 2: 查找行末的选项 (Direct 模式或 CoT 结尾)
+    # 匹配文本最后出现的独立字母
+    matches = re.findall(r'\b([A-D])\b', text.upper())
+    if matches:
+        return matches[-1] # 取最后一个提到的选项，通常是结论
+        
+    # 策略 3: 严格匹配开头 (Direct 模式)
+    match = re.match(r'^([A-D])([.,:;)]|$)', text.upper())
+    if match:
+        return match.group(1)
 
-def evaluate_exam_results_with_judge_model(results_list, judge_model_path, device):
-    print(f"\n>>> Loading Judge Model from: {judge_model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(judge_model_path)
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(judge_model_path, torch_dtype=torch.bfloat16, device_map=device)
-    model.eval()
-    
+    return "None"
+
+def evaluate_exam_results_with_regex(results_list):
     total_stats = {"correct": 0, "total": 0}
     cat_stats = defaultdict(lambda: {"correct": 0, "total": 0})
     
-    print(f"\n>>> Starting AI Evaluation on {len(results_list)} samples...")
-    for i, item in enumerate(tqdm(results_list, desc="AI Judging")):
+    # 【新增功能】用于记录提取结果为 None 的样本索引
+    none_indices = []
+    
+    print(f"\n>>> Starting Regex Evaluation on {len(results_list)} samples...")
+    for i, item in enumerate(tqdm(results_list, desc="Regex Judging")):
         gt = item.get("ground_truth", "").strip()
         pred = item.get("prediction", "").strip()
         cat = item.get("category", "Uncategorized")
-        input_text = item.get("full_input_text", "")
         
-        is_correct_val = run_ai_judge(model, tokenizer, input_text, gt, pred, device)
+        gt_opt = extract_answer_option(gt)
+        pred_opt = extract_answer_option(pred)
+        
+        # 【新增功能】如果提取结果为 None，记录索引
+        if pred_opt == "None":
+            # 如果原始数据里有 'id' 字段，记录 id；否则记录列表索引 i
+            record_id = item.get("id", i) 
+            none_indices.append(record_id)
+        
+        is_correct_val = 1 if (gt_opt != "None" and gt_opt == pred_opt) else 0
+        
         item["judge_score"] = is_correct_val
-        item["judge_model"] = judge_model_path 
+        item["judge_type"] = "regex"
+        item["extracted_gt"] = gt_opt
+        item["extracted_pred"] = pred_opt
         
         total_stats["total"] += 1
         cat_stats[cat]["total"] += 1
@@ -232,18 +253,14 @@ def evaluate_exam_results_with_judge_model(results_list, judge_model_path, devic
             total_stats["correct"] += 1
             cat_stats[cat]["correct"] += 1
 
-    print(f"\n{'='*25} AI Judge Report (Raw LLM) {'='*25}")
-    print(f"Subject Model (Raw): Original LLM")
-    print(f"Judge Model: {judge_model_path}")
+    # === 原有的打印逻辑 ===
+    print(f"\n{'='*25} Regex Judge Report {'='*25}")
     print(f"{'Category':<35} | {'Acc':<8} | {'Correct':<8} | {'Total':<8}")
     print("-" * 75)
 
     forced_order = [
-        "Pattern Recognition",
-        "Noise Understanding",
-        "Anomaly Detection", 
-        "Similarity Analysis",
-        "Causality Analysis"
+        "Pattern Recognition", "Noise Understanding", "Anomaly Detection", 
+        "Similarity Analysis", "Causality Analysis"
     ]
     
     printed_categories = set()
@@ -267,7 +284,17 @@ def evaluate_exam_results_with_judge_model(results_list, judge_model_path, devic
     print("-" * 75)
     total_acc = (total_stats['correct'] / total_stats['total']) * 100 if total_stats['total'] > 0 else 0.0
     print(f"{'OVERALL':<35} | {total_acc:<7.2f}% | {total_stats['correct']:<8} | {total_stats['total']:<8}")
+    
+    # === 【新增功能】打印 None 统计信息 ===
+    print("-" * 75)
+    print(f"Failed Extraction (None) Count : {len(none_indices)}")
+    if len(none_indices) > 0:
+        # 仅打印前 50 个 ID，防止刷屏
+        display_ids = none_indices[:50]
+        suffix = "..." if len(none_indices) > 50 else ""
+        print(f"Sample Indices with 'None'     : {display_ids} {suffix}")
     print("=" * 75 + "\n")
+    
     return results_list
 
 # ==========================================
@@ -284,15 +311,17 @@ def cleanup_distributed():
     if dist.is_initialized(): dist.destroy_process_group()
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Raw LLM (Baseline) - Multi GPU with External AI Judge")
+    parser = argparse.ArgumentParser(description="Test Raw LLM (Baseline) - Multi GPU with Regex Judge")
     parser.add_argument("--jsonl-path", type=str, required=True, help="Path to exam jsonl file")
     parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-3.2-3B", help="Path to the RAW LLM")
-    parser.add_argument("--judge-model-path", type=str, required=True, help="Path to the external AI Judge model")
     parser.add_argument("--output-file", type=str, default="chatts_raw_llm_exam_results.jsonl")
     parser.add_argument("--num-gen-samples", type=int, default=100)
-    # 兼容参数 (dataset 需要，但对 Raw LLM 仅用于数据读取)
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--patch-stride", type=int, default=8)
+    
+    # [新增] CoT 开关
+    parser.add_argument("--enable-cot", action="store_true", 
+                        help="Enable Chain-of-Thought reasoning (generate analysis before answer).")
     
     args = parser.parse_args()
     
@@ -303,6 +332,8 @@ def main():
     
     if rank == 0:
         print(f">>> Loading RAW LLM: {args.llm_model_path}")
+        mode_str = "Chain-of-Thought (Analysis First)" if args.enable_cot else "Direct Answer (Constraint Decoding)"
+        print(f">>> Inference Mode: {mode_str}")
         print(">>> Note: Time series will be serialized to text strings.")
     
     # 1. 加载 Tokenizer 和 Raw Model
@@ -332,12 +363,16 @@ def main():
     max_samples = (args.num_gen_samples + world_size - 1) // world_size if args.num_gen_samples > 0 else None
     if args.num_gen_samples == -1: max_samples = None
 
-    # 3. 推理
-    generate_predictions_raw(model, tokenizer, loader, device, args.output_file, rank, max_samples)
+    # 3. 推理 (传入 CoT 参数)
+    generate_predictions_raw(
+        model, tokenizer, loader, device, args.output_file, rank, 
+        max_samples=max_samples,
+        enable_cot=args.enable_cot
+    )
     
     if dist.is_initialized(): dist.barrier()
     
-    # === Phase 2: Evaluation using AI Judge ===
+    # === Phase 2: Evaluation using Regex ===
     
     if rank == 0:
         print(f">>> Merging results from all {world_size} ranks...")
@@ -350,12 +385,9 @@ def main():
                 os.remove(fname)
         
         print(f">>> Total Samples Generated: {len(merged_results)}")
-        print(">>> Unloading subject model to free GPU memory for Judge...")
         
-        del model
-        torch.cuda.empty_cache()
-        
-        final_scored_results = evaluate_exam_results_with_judge_model(merged_results, args.judge_model_path, device)
+        # 使用更新后的正则评估
+        final_scored_results = evaluate_exam_results_with_regex(merged_results)
         
         with open(args.output_file, 'w', encoding='utf-8') as f:
             for item in final_scored_results: f.write(json.dumps(item, ensure_ascii=False) + "\n")

@@ -15,7 +15,6 @@ class CROMEConfig:
     """
     全局配置。
     """
-
     input_channels: int
     llm_embed_dim: int
     patch_len: int = 16
@@ -26,13 +25,12 @@ class CROMEConfig:
     freeze_patch_encoder: bool = False
     query_tokens: int = 32
     adapter_hidden_dim: int = 256
-    fuse_mode: str = "add"  # or "concat"
+    fuse_mode: str = "add"
     epsilon: float = 1e-4
     # LLM 接口
     llm_model_path: str = "/root/emhua/btwu/Llama-2-7b-hf"
     llm_dtype: str = "bfloat16"
     llm_device_map: str = "auto"
-    # 注意：原本的 stat_fourier_features 等参数已废弃，保留是为了兼容旧Config加载
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -56,18 +54,23 @@ def get_llm_embed_dim(llm_model_path: str) -> int:
     except Exception as e:
         raise RuntimeError(f"加载模型配置失败: {e}。模型路径: {llm_model_path}")
 
-
 class RevIN(nn.Module):
-    """Reversible Instance Normalization。"""
     def __init__(self, eps: float = 1e-4):
         super().__init__()
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        mu = x.mean(dim=1, keepdim=True)
-        sigma = x.std(dim=1, keepdim=True).clamp_min(self.eps)
-        x_norm = (x - mu) / sigma
-        stats = torch.stack((mu.squeeze(1), sigma.squeeze(1)), dim=-1)
+        if x.dtype != torch.float32:
+            pass
+        orig_dtype = x.dtype
+        x_fp32 = x.float()
+        
+        mu = x_fp32.mean(dim=1, keepdim=True)
+        sigma = x_fp32.std(dim=1, keepdim=True).clamp_min(self.eps)
+        
+        x_norm = (x_fp32 - mu) / sigma
+        x_norm = x_norm.to(dtype=orig_dtype)
+        stats = torch.stack((mu.squeeze(1), sigma.squeeze(1)), dim=-1).to(dtype=orig_dtype)
         return x_norm, stats
 
 
@@ -143,8 +146,8 @@ class PatchTSTEncoder(nn.Module):
     """模块 II：冻结 PatchTST 形态编码器。"""
     def __init__(self, config: CROMEConfig, input_dim: int):
         super().__init__()
+        self.config = config 
         self.embedding = PatchEmbedding(config, input_dim)
-        self.config=config
         layer = nn.TransformerEncoderLayer(
             d_model=config.patch_embedding_dim,
             nhead=config.patch_num_heads,
@@ -159,10 +162,6 @@ class PatchTSTEncoder(nn.Module):
             p.requires_grad_(False)
 
     def forward(self, x: Tensor) -> Tensor:
-        # 如果需要解冻，这里可以去掉 no_grad，但通常 encoder forward 逻辑简单
-        # 为了兼容性保持原状，外层训练脚本控制 requires_grad 即可
-        # 如果需要梯度回传，PatchTSTEncoder 内部不应该强制 no_grad
-        # 修正：根据 freeze_patch_encoder 决定是否启用 grad
         if self.config.freeze_patch_encoder:
             with torch.no_grad():
                 emb = self.embedding(x)
@@ -173,26 +172,106 @@ class PatchTSTEncoder(nn.Module):
 
 
 class QFormer(nn.Module):
-    """模块 III 分支 A：Query Former。"""
+    """
+    模块 III 分支 A：Text-Guided Q-Former (方案 B+ 增强版).
+    包含：
+    1. Cross-Attention 文本引导
+    2. Attention 权重暴露 (用于可视化)
+    3. 全面 Dropout (防止过拟合)
+    """
     def __init__(self, config: CROMEConfig):
         super().__init__()
         self.config = config
+        
+        # [新增] 获取 Dropout 率，优先从 config 读取，默认为 0.1
+        dropout_rate = getattr(config, "dropout", 0.1)
+        
+        # 1. 可学习的 Query Tokens (Base Queries)
         self.query_tokens = nn.Parameter(
             torch.randn(config.query_tokens, config.patch_embedding_dim)
         )
-        self.attn = nn.MultiheadAttention(
-            config.patch_embedding_dim, config.patch_num_heads, batch_first=True
+        
+        # 2. 文本交互层 (Text Interaction)
+        # 将 LLM Embedding (如 4096) 投影到 Patch 维度 (如 512)
+        self.text_proj = nn.Linear(config.llm_embed_dim, config.patch_embedding_dim)
+        
+        # Cross-Attention: Query 关注 Text
+        # [修改] 启用 dropout
+        self.text_attn = nn.MultiheadAttention(
+            embed_dim=config.patch_embedding_dim,
+            num_heads=config.patch_num_heads,
+            dropout=dropout_rate, 
+            batch_first=True
         )
-        self.ln = nn.LayerNorm(config.patch_embedding_dim)
+        self.ln_text = nn.LayerNorm(config.patch_embedding_dim)
+
+        # 3. 时序提取层 (Time-Series Extraction)
+        # Cross-Attention: Query 关注 TS Patch
+        # [修改] 启用 dropout
+        self.ts_attn = nn.MultiheadAttention(
+            embed_dim=config.patch_embedding_dim,
+            num_heads=config.patch_num_heads,
+            dropout=dropout_rate,
+            batch_first=True
+        )
+        self.ln_ts = nn.LayerNorm(config.patch_embedding_dim)
+        
+        # [新增] 通用 Dropout 层
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # 初始化投影层
+        nn.init.zeros_(self.text_proj.weight)
+        nn.init.zeros_(self.text_proj.bias)
+
+        # 用于存储可视化权重
+        self.last_text_attn_weights = None
 
     def forward(self, patch_tokens: Tensor, instruction_embeds: Optional[Tensor] = None) -> Tensor:
         b = patch_tokens.size(0)
-        queries = self.query_tokens.unsqueeze(0).expand(b, -1, -1)
-        key = patch_tokens if instruction_embeds is None else torch.cat(
-            [patch_tokens, instruction_embeds], dim=1
+        
+        # 1. 扩展 Base Query
+        queries = self.query_tokens.unsqueeze(0).expand(b, -1, -1) # [B, 32, D]
+        
+        # 重置可视化权重 (防止 Text Dropout 时残留旧权重)
+        self.last_text_attn_weights = None
+        
+        # 2. [阶段一] 文本引导：Query 主动“读取”指令
+        if instruction_embeds is not None:
+            # instruction_embeds: [B, Text_Len, LLM_Dim]
+            
+            # (A) 类型转换 (解决 BF16 vs FP32 冲突)
+            instruction_embeds = instruction_embeds.to(dtype=self.text_proj.weight.dtype)
+
+            # (B) 投影文本特征
+            text_kv = self.text_proj(instruction_embeds) # [B, Text_Len, D]
+            
+            # (C) Cross-Attention: Q=Queries, K=Text, V=Text
+            # [修改] 获取 Attention 权重
+            text_out, attn_weights = self.text_attn(
+                query=queries,
+                key=text_kv,
+                value=text_kv
+            )
+            
+            # [新增] 保存权重供可视化 (Detach + CPU 以节省显存)
+            # 形状通常为 [Batch, Queries, Text_Len] (若 average_attn_weights=True)
+            self.last_text_attn_weights = attn_weights.detach().cpu()
+            
+            # (D) 残差 + Norm + [新增] Dropout
+            # 注意：这里采用了 Pre-Norm 或 Post-Norm 结构均可，这里维持原有的 Post-Norm 逻辑
+            # Query = Norm(Query + Dropout(Attn(Q, Text)))
+            queries = self.ln_text(queries + self.dropout(text_out))
+        
+        # 3. [阶段二] 时序提取：带着意图的 Query 提取时序特征
+        # Q=Queries(Text-Aware), K=TS_Patch, V=TS_Patch
+        ts_out, _ = self.ts_attn(
+            query=queries, 
+            key=patch_tokens, 
+            value=patch_tokens
         )
-        attn_out, _ = self.attn(queries, key, key)
-        return self.ln(attn_out)
+        
+        # [修改] 输出前应用 Dropout
+        return self.ln_ts(self.dropout(ts_out))
 
 
 class DetailProjection(nn.Module):
@@ -208,14 +287,11 @@ class DetailProjection(nn.Module):
 class RobustFiLMGenerator(nn.Module):
     """
     Robust Log-Space FiLM Generator.
-    解决梯度冲突与尺度爆炸问题：
-    1. 独立于主干特征流，梯度不互通。
-    2. 使用对数变换预处理，适应不同量级的时间序列。
     """
     def __init__(self, config: CROMEConfig):
         super().__init__()
-        # 输入特征：log_mu, log_sigma, sign_mu, cv
-        input_dim = 4
+        # input_dim = 3 (log_mu, log_sigma, sign_mu)
+        input_dim = 3
         
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, config.adapter_hidden_dim),
@@ -224,12 +300,10 @@ class RobustFiLMGenerator(nn.Module):
             nn.Linear(config.adapter_hidden_dim, config.adapter_hidden_dim * 2) # gamma, beta
         )
         
-        # 零初始化最后一层，使初始状态为恒等变换
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, stats: Tensor) -> Tuple[Tensor, Tensor]:
-        # stats: [B, 2] -> (mean, std)
         if stats.dim() == 2:
             mu = stats[..., 0:1]
             sigma = stats[..., 1:2]
@@ -237,17 +311,15 @@ class RobustFiLMGenerator(nn.Module):
             mu = stats[..., 0]
             sigma = stats[..., 1]
             
-        # 数值稳定化预处理
         log_mu = torch.log1p(mu.abs())
         log_sigma = torch.log1p(sigma)
         sign_mu = torch.sign(mu)
-        cv = mu / (sigma + 1e-5) # 变异系数特征
         
-        features = torch.cat([log_mu, log_sigma, sign_mu, cv], dim=-1)
+        features = torch.cat([log_mu, log_sigma, sign_mu], dim=-1)
         out = self.mlp(features)
         
         if out.dim() == 2:
-            out = out.unsqueeze(1) # [B, 1, 2*H]
+            out = out.unsqueeze(1) 
             
         gamma, beta = out.chunk(2, dim=-1)
         return gamma, beta
@@ -262,11 +334,8 @@ class CROMEAdapterBlock(nn.Module):
 
     def forward(self, x: Tensor, gamma: Optional[Tensor] = None, beta: Optional[Tensor] = None) -> Tensor:
         z = F.silu(self.down(x)) * self.gate(x)
-        
-        # FiLM 调制
         if gamma is not None and beta is not None:
             z = z * (1 + gamma) + beta
-
         return x + self.up(z)
 
 
@@ -288,10 +357,7 @@ class CROMEAdapter(nn.Module):
         beta: Optional[Tensor] = None
     ) -> Tensor:
         query_out = self.query_adapter(query_tokens)
-        
-        # 仅对 Detail Path 应用 FiLM
         patch_out = self.patch_adapter(patch_tokens, gamma=gamma, beta=beta)
-        
         return torch.cat([query_out, patch_out], dim=1)
 
 
@@ -351,10 +417,6 @@ class FrozenLLM(nn.Module):
 
 
 class CROMETSModel(nn.Module):
-    """
-    模块 V：CROME 主体模型 (FiLM Enhanced, No Stat Token)
-    """
-
     def __init__(self, config: CROMEConfig):
         super().__init__()
         self.config = config
@@ -363,37 +425,30 @@ class CROMETSModel(nn.Module):
         )
         self.preprocessor = InputPreprocessor(config)
         self.shape_encoder = PatchTSTEncoder(config, pre_input_dim)
+        # 使用新的 Text-Guided QFormer
         self.qformer = QFormer(config)
         self.detail_proj = DetailProjection(config)
         
-        # FiLM Generator
         self.film_generator = RobustFiLMGenerator(config)
-        
         self.adapter = CROMEAdapter(config)
-        
-        # 移除 StatProjector
-        # self.stat_projector = StatProjector(config)
         
         self.llm_proj = nn.Linear(config.patch_embedding_dim, config.llm_embed_dim)
 
     def _process_single_channel(
         self,
         channel_data: Tensor,
-        instruction_embeds: Optional[Tensor] = None,
+        instruction_embeds: Optional[Tensor] = None, # 接收文本特征
     ) -> Tensor:
-        """
-        处理单通道数据，仅返回 ts_tokens (stat token 已移除)
-        """
         x, stats = self.preprocessor(channel_data)
-        
-        # 生成 FiLM 参数
         gamma, beta = self.film_generator(stats)
         
         patch_tokens = self.shape_encoder(x)
+        
+        # 传入 instruction_embeds 给 QFormer
         query_tokens = self.qformer(patch_tokens, instruction_embeds)
+        
         detail_tokens = self.detail_proj(patch_tokens)
         
-        # FiLM 调制与融合
         ts_tokens = self.adapter(query_tokens, detail_tokens, gamma=gamma, beta=beta)
         ts_tokens = self.llm_proj(ts_tokens)
         
@@ -407,11 +462,11 @@ class CROMETSModel(nn.Module):
         instruction_embeds: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         target_dtype = text_prefix.dtype
-        
         x, stats = self.preprocessor(raw_series)
         gamma, beta = self.film_generator(stats)
         
         patch_tokens = self.shape_encoder(x)
+        # 传入 instruction_embeds
         query_tokens = self.qformer(patch_tokens, instruction_embeds)
         detail_tokens = self.detail_proj(patch_tokens)
         
@@ -421,7 +476,6 @@ class CROMETSModel(nn.Module):
         if ts_tokens.dtype != target_dtype:
             ts_tokens = ts_tokens.to(dtype=target_dtype)
             
-        # 拼接：移除 stat_token
         assembled = torch.cat(
             [text_prefix, ts_tokens, text_suffix],
             dim=1,
@@ -433,10 +487,6 @@ class CROMETSModel(nn.Module):
 
 
 class StatBypassCROMETS1(nn.Module):
-    """
-    端到端系统封装：支持 ChatTS 格式与 Text Stats Dropout
-    """
-
     def __init__(self, config: CROMEConfig):
         super().__init__()
         self.config = config
@@ -489,6 +539,25 @@ class StatBypassCROMETS1(nn.Module):
             ts_marker = "<ts><ts/>"
             text_parts = input_text.split(ts_marker)
             
+            # =================================================================
+            # [新增] 拼接所有文本片段作为全局指令 (Fix from discussion)
+            # =================================================================
+            full_instruction_text = " ".join([p.strip() for p in text_parts if p.strip()])
+            
+            current_instruction_embeds = None
+            drop_text = self.training and (torch.rand(1).item() < 0.15)
+            
+            if full_instruction_text and not drop_text:
+                # 正常提取文本特征
+                instr_encoded = self.tokenizer([full_instruction_text], device)
+                input_ids = instr_encoded["input_ids"]
+                if input_ids.shape[1] > 512:
+                     input_ids = input_ids[:, :512]
+                current_instruction_embeds = self.llm.embed(input_ids)
+            else:
+                # 触发 Dropout，传入 None，强迫模型使用静态 Query
+                current_instruction_embeds = None
+
             num_markers = len(text_parts) - 1
             num_timeseries = len(timeseries_list)
             
@@ -505,7 +574,7 @@ class StatBypassCROMETS1(nn.Module):
             
             target_dtype = next(self.llm.parameters()).dtype
             
-            # Prefix
+            # 处理 Prefix Text (用于输入 LLM)
             if text_parts[0]:
                 prefix_encoded = self.tokenizer([text_parts[0]], device)
                 prefix_embed = self.llm.embed(prefix_encoded["input_ids"])
@@ -518,7 +587,7 @@ class StatBypassCROMETS1(nn.Module):
             
             prefix_mask_lengths.append(prefix_length)
             
-            # Process Time Series
+            # 处理 TimeSeries (插入)
             for ts_idx, ts_tensor in enumerate(timeseries_list):
                 ts_tensor = ts_tensor.to(device)
                 
@@ -531,30 +600,28 @@ class StatBypassCROMETS1(nn.Module):
                     ts_mean = ts_std = ts_min = ts_max = 0.0
                 
                 # === Text Stats Dropout ===
-                # 训练时 50% 概率丢弃统计量文本
                 if self.training and torch.rand(1).item() < 0.5:
                     stats_str = ""
                 else:
                     stats_str = f" [Stats: mean={ts_mean:.2f}, std={ts_std:.2f}, min={ts_min:.2f}, max={ts_max:.2f}] "
                 
-                stats_encoded = self.tokenizer([stats_str], device)
-                stats_embed = self.llm.embed(stats_encoded["input_ids"])
-                stats_mask = stats_encoded["attention_mask"]
-                
-                segment_embeds.append(stats_embed[0])
-                segment_masks.append(stats_mask[0])
+                if stats_str:
+                    stats_encoded = self.tokenizer([stats_str], device)
+                    stats_embed = self.llm.embed(stats_encoded["input_ids"])
+                    stats_mask = stats_encoded["attention_mask"]
+                    segment_embeds.append(stats_embed[0])
+                    segment_masks.append(stats_mask[0])
                 
                 ts_batch = ts_tensor.unsqueeze(0)
                 
-                # 获取 TS Tokens (无 stat token)
+                # [关键] 传入 instruction_embeds
                 ts_tokens = self.ts_model._process_single_channel(
-                    ts_batch, instruction_embeds=None
+                    ts_batch, instruction_embeds=current_instruction_embeds
                 )
                 
                 if ts_tokens.dtype != target_dtype:
                     ts_tokens = ts_tokens.to(dtype=target_dtype)
                 
-                # 拼接：直接使用 ts_tokens
                 ts_embed = ts_tokens[0]
                 
                 segment_embeds.append(ts_embed)
@@ -567,7 +634,6 @@ class StatBypassCROMETS1(nn.Module):
                     segment_embeds.append(sep_embed)
                     segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
                 
-                # Middle Text
                 text_idx = ts_idx + 1
                 if text_idx < len(text_parts) and text_parts[text_idx]:
                     text_encoded = self.tokenizer([text_parts[text_idx]], device)
@@ -576,7 +642,6 @@ class StatBypassCROMETS1(nn.Module):
                     segment_embeds.append(text_embed[0])
                     segment_masks.append(text_mask[0])
             
-            # Suffix
             if output_text:
                 suffix_encoded = self.tokenizer([output_text], device)
                 suffix_embed = self.llm.embed(suffix_encoded["input_ids"])
@@ -595,7 +660,6 @@ class StatBypassCROMETS1(nn.Module):
             assembled_embeds_list.append(full_embed)
             attention_masks_list.append(full_mask)
         
-        # Batch Padding
         max_len = max(emb.shape[0] for emb in assembled_embeds_list)
         embed_dim = assembled_embeds_list[0].shape[1]
         
@@ -621,6 +685,7 @@ class StatBypassCROMETS1(nn.Module):
             "suffix_mask_lengths": suffix_mask_lengths,
         }
 
+    # 用于 Stage 2 或其他非 ChatTS 格式的 Forward
     def forward(
         self,
         raw_series: Tensor,
@@ -637,6 +702,8 @@ class StatBypassCROMETS1(nn.Module):
         instruction_embeds = None
         if instruction_text is not None:
             instr_encoded = self.tokenizer(instruction_text, device)
+            # 使用 no_grad 避免在这里计算 LLM 的梯度 (只训练 projector)
+            # with torch.no_grad():
             instruction_embeds = self.llm.embed(instr_encoded["input_ids"])
             
         ts_outputs = self.ts_model(
@@ -655,7 +722,6 @@ class StatBypassCROMETS1(nn.Module):
             device=device,
             dtype=prefix_mask.dtype,
         )
-        # 移除 stat_token 对应的 mask (ones)
         attention_mask = torch.cat(
             [prefix_mask, ts_mask, suffix_mask],
             dim=1,

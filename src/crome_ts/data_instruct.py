@@ -145,139 +145,139 @@ import numpy as np
 #             "suffix": report
 #         }
 
-# def _record_to_array(record: Dict[str, Any], record_idx: int) -> np.ndarray:
-#     """
-#     将 JSONL 记录中的时序数据解析为二维 numpy 数组。
-#     输入数据应该是 [T, C] 格式（时间步在外层，通道在内层）。
+def _record_to_array(record: Dict[str, Any], record_idx: int) -> np.ndarray:
+    """
+    将 JSONL 记录中的时序数据解析为二维 numpy 数组。
+    输入数据应该是 [T, C] 格式（时间步在外层，通道在内层）。
     
-#     输出格式为 [时间步, 通道]，即 [T, C]
+    输出格式为 [时间步, 通道]，即 [T, C]
     
-#     Args:
-#         record: JSON记录
-#         record_idx: 记录索引（用于错误提示）
-#     """
-#     ts_data = record.get("input_ts")
-#     if ts_data is None:
-#         ts_data = record.get("ts_data")
-#     if ts_data is None:
-#         raise ValueError(
-#             f"Record {record_idx} 缺少内联时序字段 `input_ts`，"
-#             "请先将遗留的 `*_ts_path` 数据迁移为嵌入式 JSON。"
-#         )
+    Args:
+        record: JSON记录
+        record_idx: 记录索引（用于错误提示）
+    """
+    ts_data = record.get("input_ts")
+    if ts_data is None:
+        ts_data = record.get("ts_data")
+    if ts_data is None:
+        raise ValueError(
+            f"Record {record_idx} 缺少内联时序字段 `input_ts`，"
+            "请先将遗留的 `*_ts_path` 数据迁移为嵌入式 JSON。"
+        )
     
-#     array = np.asarray(ts_data, dtype=np.float32)
+    array = np.asarray(ts_data, dtype=np.float32)
     
-#     # 处理不同维度的数据
-#     if array.ndim == 2:
-#         # 已经是 [T, C] 格式，保持原样
-#         pass
-#     elif array.ndim == 1:
-#         # 单通道数据，转换为 [T, 1]
-#         array = array.reshape(-1, 1)
-#     elif array.ndim > 2:
-#         # 多维数组，展平
-#         array = array.reshape(array.shape[0], -1)
+    # 处理不同维度的数据
+    if array.ndim == 2:
+        # 已经是 [T, C] 格式，保持原样
+        pass
+    elif array.ndim == 1:
+        # 单通道数据，转换为 [T, 1]
+        array = array.reshape(-1, 1)
+    elif array.ndim > 2:
+        # 多维数组，展平
+        array = array.reshape(array.shape[0], -1)
     
-#     return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# class JSONLInstructDataset(Dataset):
-#     """
-#     JSONL 格式的指令微调数据集
-#     支持从 JSONL 文件加载指令、时间序列路径和输出文本。
-#     数据格式应为 [T, C]（时间步在外层，通道在内层）。
-#     支持自动检测通道数（当input_channels为None时）。
-#     """
-#     def __init__(
-#         self,
-#         jsonl_path: str,
-#         seq_len: int,
-#         input_channels: Optional[int] = None,  # 如果为None，将从数据中自动检测
-#         split: str = "train",
-#         split_ratio: float = 0.9,
-#     ):
-#         self.seq_len = seq_len
+class JSONLInstructDataset(Dataset):
+    """
+    JSONL 格式的指令微调数据集
+    支持从 JSONL 文件加载指令、时间序列路径和输出文本。
+    数据格式应为 [T, C]（时间步在外层，通道在内层）。
+    支持自动检测通道数（当input_channels为None时）。
+    """
+    def __init__(
+        self,
+        jsonl_path: str,
+        seq_len: int,
+        input_channels: Optional[int] = None,  # 如果为None，将从数据中自动检测
+        split: str = "train",
+        split_ratio: float = 0.9,
+    ):
+        self.seq_len = seq_len
         
-#         jsonl_file = Path(jsonl_path)
-#         if not jsonl_file.exists():
-#             raise FileNotFoundError(f"JSONL file not found: {jsonl_file}")
+        jsonl_file = Path(jsonl_path)
+        if not jsonl_file.exists():
+            raise FileNotFoundError(f"JSONL file not found: {jsonl_file}")
         
-#         # 加载 JSONL 文件
-#         records = []
-#         with jsonl_file.open("r", encoding="utf-8") as f:
-#             for line in f:
-#                 line = line.strip()
-#                 if not line:
-#                     continue
-#                 records.append(json.loads(line))
+        # 加载 JSONL 文件
+        records = []
+        with jsonl_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
         
-#         if len(records) == 0:
-#             raise ValueError(f"JSONL file is empty: {jsonl_file}")
+        if len(records) == 0:
+            raise ValueError(f"JSONL file is empty: {jsonl_file}")
         
-#         # 自动检测通道数（如果需要）
-#         if input_channels is None:
-#             # 从第一个记录中检测通道数
-#             first_record = records[0]
-#             sample_array = _record_to_array(first_record, 0)
-#             detected_channels = sample_array.shape[1]
-#             self.input_channels = detected_channels
-#             print(f"[{split.upper()}] Auto-detected {detected_channels} channels from data")
-#         else:
-#             self.input_channels = input_channels
+        # 自动检测通道数（如果需要）
+        if input_channels is None:
+            # 从第一个记录中检测通道数
+            first_record = records[0]
+            sample_array = _record_to_array(first_record, 0)
+            detected_channels = sample_array.shape[1]
+            self.input_channels = detected_channels
+            print(f"[{split.upper()}] Auto-detected {detected_channels} channels from data")
+        else:
+            self.input_channels = input_channels
         
-#         # 划分训练/验证集
-#         split_idx = int(len(records) * split_ratio)
-#         if split == "train":
-#             self.records = records[:split_idx]
-#         else:
-#             self.records = records[split_idx:]
+        # 划分训练/验证集
+        split_idx = int(len(records) * split_ratio)
+        if split == "train":
+            self.records = records[:split_idx]
+        else:
+            self.records = records[split_idx:]
         
-#         print(f"[{split.upper()}] Loaded {len(self.records)} samples from {jsonl_file.name} (channels: {self.input_channels})")
+        print(f"[{split.upper()}] Loaded {len(self.records)} samples from {jsonl_file.name} (channels: {self.input_channels})")
     
-#     def __len__(self):
-#         return len(self.records)
+    def __len__(self):
+        return len(self.records)
     
-#     def __getitem__(self, idx):
-#         record = self.records[idx]
+    def __getitem__(self, idx):
+        record = self.records[idx]
         
-#         # 加载时间序列数据（优先读取嵌入式字段）
-#         array = _record_to_array(record, idx)
+        # 加载时间序列数据（优先读取嵌入式字段）
+        array = _record_to_array(record, idx)
         
-#         # 确保长度匹配
-#         if array.shape[0] > self.seq_len:
-#             # 截取最后 seq_len 个时间步
-#             array = array[-self.seq_len:]
-#         elif array.shape[0] < self.seq_len:
-#             # 填充零
-#             pad_len = self.seq_len - array.shape[0]
-#             pad = np.zeros((pad_len, array.shape[1]))
-#             array = np.vstack([array, pad])
+        # 确保长度匹配
+        if array.shape[0] > self.seq_len:
+            # 截取最后 seq_len 个时间步
+            array = array[-self.seq_len:]
+        elif array.shape[0] < self.seq_len:
+            # 填充零
+            pad_len = self.seq_len - array.shape[0]
+            pad = np.zeros((pad_len, array.shape[1]))
+            array = np.vstack([array, pad])
         
-#         # 处理通道数
-#         if array.shape[1] > self.input_channels:
-#             array = array[:, :self.input_channels]
-#         elif array.shape[1] < self.input_channels:
-#             pad_channels = self.input_channels - array.shape[1]
-#             pad = np.zeros((self.seq_len, pad_channels))
-#             array = np.hstack([array, pad])
+        # 处理通道数
+        if array.shape[1] > self.input_channels:
+            array = array[:, :self.input_channels]
+        elif array.shape[1] < self.input_channels:
+            pad_channels = self.input_channels - array.shape[1]
+            pad = np.zeros((self.seq_len, pad_channels))
+            array = np.hstack([array, pad])
         
-#         window = torch.tensor(array, dtype=torch.float32)
+        window = torch.tensor(array, dtype=torch.float32)
         
-#         # 获取指令和输出文本
-#         instruction = record.get("instruction", "").strip()
-#         output_text = record.get("output_text", "").strip()
+        # 获取指令和输出文本
+        instruction = record.get("instruction", "").strip()
+        output_text = record.get("output_text", "").strip()
         
-#         # 构建 prefix（指令格式）
-#         if instruction:
-#             prefix = f"User: {instruction}\nAssistant: "
-#         else:
-#             prefix = "User: Analyze the following time series data.\nAssistant: "
+        # 构建 prefix（指令格式）
+        if instruction:
+            prefix = f"User: {instruction}\nAssistant: "
+        else:
+            prefix = "User: Analyze the following time series data.\nAssistant: "
         
-#         return {
-#             "series": window,
-#             "prefix": prefix,
-#             "suffix": output_text
-#         }
+        return {
+            "series": window,
+            "prefix": prefix,
+            "suffix": output_text
+        }
 
 class ChatTSDataset(Dataset):
     """
@@ -435,6 +435,7 @@ class ChatTSDataset(Dataset):
         
         # 构建返回字典
         return {
+            "sample_idx": idx,
             "input_text": final_input_text,  # 包含 <ts><ts/> 标记的原始文本
             "timeseries_list": processed_series,  # 处理后的时间序列列表
             "output_text": output_text,  # 输出文本
@@ -453,11 +454,13 @@ def chatts_collate_fn(batch):
     ChatTS 格式的 collate 函数
     处理包含多个时间序列的批次数据
     """
+    sample_idxs = [item["sample_idx"] for item in batch]
     input_texts = [item["input_text"] for item in batch]
     timeseries_lists = [item["timeseries_list"] for item in batch]
     output_texts = [item["output_text"] for item in batch]
     
     return {
+        "sample_idxs": sample_idxs,
         "input_texts": input_texts,
         "timeseries_lists": timeseries_lists,
         "output_texts": output_texts,
