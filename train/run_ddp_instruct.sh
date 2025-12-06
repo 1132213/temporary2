@@ -16,14 +16,15 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="7b_tattn_16"
+LAST_MODEL="8b_tattn_16_skip_new"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="7b_tattn_16_full"
+MODEL_SUFFIX="8b_tattn_16_skip_new"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/sft/new_merged.jsonl"
 JSONL_PATH="/mnt/shared-storage-user/huaermo/code/test_wbt2/sft.jsonl"
 STAGE2_CHECKPOINT="model/aligned_$LAST_MODEL.pth"
-LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-7B-Instruct"
+LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
+# LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-3B-Instruct"
  # 可选：模型名称后缀，例如设置为 "1st" 则保存为 chatts_instruct_best_ddp_1st.pth
 
 # 训练超参数
@@ -52,24 +53,6 @@ echo "Stage 2 权重: $STAGE2_CHECKPOINT"
 echo "=========================================="
 echo ""
 
-CMD="torchrun --nproc_per_node=$NUM_GPUS \
-    --master_port=29502 \
-    train/sft.py \
-    --jsonl-path \"$JSONL_PATH\" \
-    --stage2-checkpoint \"$STAGE2_CHECKPOINT\" \
-    --llm-model-path \"$LLM_PATH\" \
-    --seq-len $SEQ_LEN \
-    --patch-len $PATCH_LEN \
-    --patch-stride $PATCH_STRIDE \
-    --batch-size $BATCH_SIZE \
-    --gradient-accumulation-steps $GRADIENT_ACCUM \
-    --lr $LR \
-    --epochs $EPOCHS \
-    --num-workers 4 \
-    --freeze-encoder \
-    --save-only-trainable \
-    --seed 42 "
-
 # CMD="torchrun --nproc_per_node=$NUM_GPUS \
 #     --master_port=29502 \
 #     train/sft.py \
@@ -83,13 +66,30 @@ CMD="torchrun --nproc_per_node=$NUM_GPUS \
 #     --gradient-accumulation-steps $GRADIENT_ACCUM \
 #     --lr $LR \
 #     --epochs $EPOCHS \
-#     --num-workers 4 \
-#     --freeze-encoder \
+#     --num-workers 16 \
 #     --save-only-trainable \
-#     --seed 42 \
-#     --use-lora \
-#     --lora-r 32 \
-#     --lora-alpha 64 "
+#     --weight-decay 0.05 \
+#     --seed 42 "
+
+CMD="torchrun --nproc_per_node=$NUM_GPUS \
+    --master_port=29502 \
+    train/sft.py \
+    --jsonl-path \"$JSONL_PATH\" \
+    --stage2-checkpoint \"$STAGE2_CHECKPOINT\" \
+    --llm-model-path \"$LLM_PATH\" \
+    --seq-len $SEQ_LEN \
+    --patch-len $PATCH_LEN \
+    --patch-stride $PATCH_STRIDE \
+    --batch-size $BATCH_SIZE \
+    --gradient-accumulation-steps $GRADIENT_ACCUM \
+    --lr $LR \
+    --epochs $EPOCHS \
+    --num-workers 16 \
+    --save-only-trainable \
+    --seed 42 \
+    --use-lora \
+    --lora-r 64 \
+    --lora-alpha 128 "
 
 # 构建训练命令
 # CMD="torchrun --nproc_per_node=$NUM_GPUS \

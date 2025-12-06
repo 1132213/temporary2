@@ -60,24 +60,26 @@ def exam_collate_fn(batch):
     return batch_dict
 
 # ==========================================
-# 2. Embedding 构建 (核心修复：Text-Guided)
+# 2. Embedding 构建 (含 Text-Guided & Ablation)
 # ==========================================
-def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
+def build_chatts_embeddings_for_inference(
+    model, input_text, ts_list, device, 
+    mask_query=False, mask_detail=False,mask_text_stats=False
+):
     """
-    构建推理用的 Embeddings，支持 Text-Guided Q-Former。
+    构建推理用的 Embeddings。
+    支持 Text-Guided Q-Former 和 特征消融 (Ablation)。
     """
     ts_marker = "<ts><ts/>"
     text_parts = input_text.split(ts_marker)
     num_markers = len(text_parts) - 1
     timeseries_list = list(ts_list)
     
-    # ================= [新增] 提取并编码全局指令 (Text-Guided) =================
-    # 拼接所有文本片段作为 Context，让 Q-Former "读懂" 指令
+    # 提取并编码全局指令 (Text-Guided)
     full_instruction_text = " ".join([p.strip() for p in text_parts if p.strip()])
     
     current_instruction_embeds = None
     if full_instruction_text:
-        # Tokenize (增加 truncation 防止超长)
         instr_encoded = model.tokenizer.tokenizer(
             full_instruction_text, 
             return_tensors="pt", 
@@ -85,9 +87,7 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
             truncation=True,
             max_length=1024 
         ).to(device)
-        # 获取 Embedding (保持类型一致)
         current_instruction_embeds = model.llm.embed(instr_encoded["input_ids"])
-    # ===========================================================================
 
     # 填充缺失的时间序列占位符
     if len(timeseries_list) < num_markers:
@@ -110,30 +110,43 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
     for idx, ts in enumerate(timeseries_list):
         ts = ts.to(device)
         
-        # --- 显式统计量文本 ---
-        if ts.numel() > 0:
-            ts_mean = ts.mean().item()
-            ts_std = ts.std().item()
-            ts_min = ts.min().item()
-            ts_max = ts.max().item()
-        else:
-            ts_mean = ts_std = ts_min = ts_max = 0.0
+        if not mask_text_stats:
+            if ts.numel() > 0:
+                ts_mean = ts.mean().item()
+                ts_std = ts.std().item()
+                ts_min = ts.min().item()
+                ts_max = ts.max().item()
+            else:
+                ts_mean = ts_std = ts_min = ts_max = 0.0
+                
+            stats_str = f" [Scale: {ts_std:.2f}, Offset: {ts_mean:.2f}] "
             
-        stats_str = f" [Stats: mean={ts_mean:.2f}, std={ts_std:.2f}, min={ts_min:.2f}, max={ts_max:.2f}] "
+            stats_tokens = tokenizer(stats_str, return_tensors="pt", add_special_tokens=False).to(device)
+            segment_embeds.append(model.llm.embed(stats_tokens.input_ids)[0])
+            segment_masks.append(stats_tokens.attention_mask[0])
         
-        stats_tokens = tokenizer(stats_str, return_tensors="pt", add_special_tokens=False).to(device)
-        segment_embeds.append(model.llm.embed(stats_tokens.input_ids)[0])
-        segment_masks.append(stats_tokens.attention_mask[0])
-        
-        # --- 时间序列 Embedding ---
+        # --- 时序特征提取 ---
         ts_batch = ts.unsqueeze(0)
         
-        # ================= [修改] 传入 instruction_embeds =================
         ts_tokens = model.ts_model._process_single_channel(
             ts_batch, 
             instruction_embeds=current_instruction_embeds
         )
-        # ====================================================================
+        
+        # =================== [新增] 消融逻辑 (Masking) ===================
+        if mask_query or mask_detail:
+            # ts_tokens shape: [1, N_tokens, Dim]
+            # 结构: [Query Tokens (32) | Detail Tokens (N)]
+            num_q = model.config.query_tokens
+            
+            if mask_query:
+                # 将前 num_q 个 token 置零
+                ts_tokens[:, :num_q, :] = 0.0
+            
+            if mask_detail:
+                # 将 num_q 之后的 token 置零
+                ts_tokens[:, num_q:, :] = 0.0
+        # ================================================================
         
         if ts_tokens.dtype != target_dtype: 
             ts_tokens = ts_tokens.to(dtype=target_dtype)
@@ -143,7 +156,7 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
         segment_embeds.append(ts_emb)
         segment_masks.append(torch.ones(ts_emb.shape[0], device=device, dtype=torch.long))
         
-        # 添加 SEP token
+        # 添加 SEP
         if idx < len(timeseries_list) - 1:
             sep_embed = model.sep_token
             if sep_embed.dtype != target_dtype: 
@@ -158,7 +171,6 @@ def build_chatts_embeddings_for_inference(model, input_text, ts_list, device):
             segment_embeds.append(model.llm.embed(tokens.input_ids)[0])
             segment_masks.append(tokens.attention_mask[0])
             
-    # 3. 最终组装
     if segment_embeds:
         full_emb = torch.cat(segment_embeds, dim=0)
         full_msk = torch.cat(segment_masks, dim=0)
@@ -171,9 +183,13 @@ def compute_test_loss(model, dataloader, device, rank):
     return 0.0
 
 # ==========================================
-# 3. 生成预测 (支持 CoT 和 Direct 模式)
+# 3. 生成预测 (支持 CoT, Direct, Ablation)
 # ==========================================
-def generate_predictions(model, dataloader, device, output_file, rank, max_samples=None, enable_cot=False):
+def generate_predictions(
+    model, dataloader, device, output_file, rank, 
+    max_samples=None, enable_cot=False,
+    mask_query=False, mask_detail=False,mask_text_stats=False
+):
     model.eval()
     results = []
     tokenizer = model.tokenizer.tokenizer
@@ -198,26 +214,25 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
                 
                 original_input = input_texts[i]
                 
-                # --- Prompt 构造策略 ---
+                # --- Prompt 构造 ---
                 if enable_cot:
-                    # 策略 A: CoT 模式 (先分析，后输出)
-                    # 引导模型一步步思考，并在最后给出固定格式的答案
                     cot_suffix = "\nLet's analyze step by step. At the end, state the answer as 'The answer is <Option>'."
-                    # 不预填 assistant 的回答，让模型自由发挥
                     full_input = f"<|im_start|>user\n{original_input}{cot_suffix}<|im_end|>\n<|im_start|>assistant\n"
-                    
-                    max_new_tokens = 512 # 给予足够的分析空间
-                    stop_prefix = None   # 不强制截断前缀
+                    max_new_tokens = 512 
+                    stop_prefix = None
                 else:
-                    # 策略 B: Direct 模式 (强制输出)
-                    # 预填 "The answer is" 强迫模型直接跟选项
                     full_input = f"<|im_start|>user\n{original_input}<|im_end|>\n<|im_start|>assistant\nThe answer is option"
-                    
-                    max_new_tokens = 16  # 只需要生成字母
+                    max_new_tokens = 16 
                     stop_prefix = "The answer is option" 
 
                 try:
-                    embeds, mask = build_chatts_embeddings_for_inference(model, full_input, ts_lists[i], device)
+                    # 传入 mask 参数
+                    embeds, mask = build_chatts_embeddings_for_inference(
+                        model, full_input, ts_lists[i], device,
+                        mask_query=mask_query,
+                        mask_detail=mask_detail,
+                        mask_text_stats=mask_text_stats
+                    )
                     
                     outs = model.llm.model.generate(
                         inputs_embeds=embeds, 
@@ -226,21 +241,18 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
                         min_new_tokens=1,   
                         pad_token_id=tokenizer.pad_token_id, 
                         eos_token_id=tokenizer.eos_token_id,
-                        do_sample=False, # 贪婪搜索
+                        do_sample=False,
                         repetition_penalty=1.1
                     )
                     pred = tokenizer.decode(outs[0], skip_special_tokens=True)
                     
                     # --- 后处理 ---
-                    # 1. 移除特殊标记
                     stop_words = ["<|im_end|>", "<|im_start|>", "user", "model"]
                     for stop_word in stop_words:
                         idx = pred.find(stop_word)
                         if idx != -1:
                             pred = pred[:idx]
                     
-                    # 2. 如果是 Direct 模式，移除我们手动加的前缀 (因为 decode 结果通常只包含新生成的)
-                    # 但为了保险，检查一下
                     if stop_prefix and stop_prefix in pred:
                         pred = pred.split(stop_prefix)[-1]
                     
@@ -250,7 +262,8 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
                         "ground_truth": gts[i],
                         "prediction": pred,
                         "category": cats[i],
-                        "mode": "cot" if enable_cot else "direct"
+                        "mode": "cot" if enable_cot else "direct",
+                        "ablation": f"mask_q={mask_query},mask_d={mask_detail}"
                     })
                     sample_count += 1
                 except Exception as e:
@@ -265,39 +278,19 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
 # 4. 正则表达式判断逻辑
 # ==========================================
 def extract_answer_option(text):
-    """
-    从文本中提取选项字母 (A, B, C, D)。
-    增强了对 CoT 长文本的提取能力。
-    """
-    if not text:
-        return "None"
-    
+    if not text: return "None"
     text = text.strip()
-    
-    # 策略 1: 查找 "The answer is X" 模式 (CoT 常用)
-    # 使用 IGNORECASE
     match = re.search(r'The answer is\s*[:\-\s]*([A-D])', text, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-        
-    # 策略 2: 查找行末的选项 (Direct 模式或 CoT 结尾)
-    # 匹配文本最后出现的独立字母
+    if match: return match.group(1).upper()
     matches = re.findall(r'\b([A-D])\b', text.upper())
-    if matches:
-        return matches[-1] # 取最后一个提到的选项，通常是结论
-        
-    # 策略 3: 严格匹配开头 (Direct 模式)
+    if matches: return matches[-1]
     match = re.match(r'^([A-D])([.,:;)]|$)', text.upper())
-    if match:
-        return match.group(1)
-
+    if match: return match.group(1)
     return "None"
 
 def evaluate_exam_results_with_regex(results_list):
     total_stats = {"correct": 0, "total": 0}
     cat_stats = defaultdict(lambda: {"correct": 0, "total": 0})
-    
-    # 【新增功能】用于记录提取结果为 None 的样本索引
     none_indices = []
     
     print(f"\n>>> Starting Regex Evaluation on {len(results_list)} samples...")
@@ -309,9 +302,7 @@ def evaluate_exam_results_with_regex(results_list):
         gt_opt = extract_answer_option(gt)
         pred_opt = extract_answer_option(pred)
         
-        # 【新增功能】如果提取结果为 None，记录索引
         if pred_opt == "None":
-            # 如果原始数据里有 'id' 字段，记录 id；否则记录列表索引 i
             record_id = item.get("id", i) 
             none_indices.append(record_id)
         
@@ -319,8 +310,6 @@ def evaluate_exam_results_with_regex(results_list):
         
         item["judge_score"] = is_correct_val
         item["judge_type"] = "regex"
-        item["extracted_gt"] = gt_opt
-        item["extracted_pred"] = pred_opt
         
         total_stats["total"] += 1
         cat_stats[cat]["total"] += 1
@@ -328,7 +317,6 @@ def evaluate_exam_results_with_regex(results_list):
             total_stats["correct"] += 1
             cat_stats[cat]["correct"] += 1
 
-    # === 原有的打印逻辑 ===
     print(f"\n{'='*25} Regex Judge Report {'='*25}")
     print(f"{'Category':<35} | {'Acc':<8} | {'Correct':<8} | {'Total':<8}")
     print("-" * 75)
@@ -338,7 +326,6 @@ def evaluate_exam_results_with_regex(results_list):
         "Similarity Analysis", "Causality Analysis"
     ]
     
-    printed_categories = set()
     for cat in forced_order:
         target_key = cat
         if cat not in cat_stats and "Anolmaly Detection" in cat_stats and cat == "Anomaly Detection":
@@ -348,9 +335,8 @@ def evaluate_exam_results_with_regex(results_list):
             s = cat_stats[target_key]
             acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
             print(f"{target_key:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
-            printed_categories.add(target_key)
     
-    remaining_cats = sorted([c for c in cat_stats.keys() if c not in printed_categories])
+    remaining_cats = sorted([c for c in cat_stats.keys() if c not in forced_order and c != "Anolmaly Detection"])
     for cat in remaining_cats:
         s = cat_stats[cat]
         acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
@@ -359,17 +345,9 @@ def evaluate_exam_results_with_regex(results_list):
     print("-" * 75)
     total_acc = (total_stats['correct'] / total_stats['total']) * 100 if total_stats['total'] > 0 else 0.0
     print(f"{'OVERALL':<35} | {total_acc:<7.2f}% | {total_stats['correct']:<8} | {total_stats['total']:<8}")
-    
-    # === 【新增功能】打印 None 统计信息 ===
     print("-" * 75)
     print(f"Failed Extraction (None) Count : {len(none_indices)}")
-    if len(none_indices) > 0:
-        # 仅打印前 50 个 ID，防止刷屏
-        display_ids = none_indices[:50]
-        suffix = "..." if len(none_indices) > 50 else ""
-        print(f"Sample Indices with 'None'     : {display_ids} {suffix}")
     print("=" * 75 + "\n")
-    
     return results_list
 
 # ==========================================
@@ -396,15 +374,17 @@ def main():
     parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-3.2-3B")
     parser.add_argument("--num-gen-samples", type=int, default=100)
     
-    # LoRA 参数
     parser.add_argument("--use-lora", action="store_true")
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     
-    # [新增] CoT 开关
     parser.add_argument("--enable-cot", action="store_true", 
-                        help="Enable Chain-of-Thought reasoning (generate analysis before answer).")
+                        help="Enable Chain-of-Thought reasoning.")
     
+    # [新增] 消融参数
+    parser.add_argument("--mask-query", action="store_true", help="[Ablation] Mask out Q-Former query tokens.")
+    parser.add_argument("--mask-detail", action="store_true", help="[Ablation] Mask out Detail projection tokens.")
+    parser.add_argument("--mask-text-stats", action="store_true", help="[Ablation] Mask out explicit text statistics (mean/std/etc).")
     args = parser.parse_args()
     
     rank, world_size, local_rank = setup_distributed()
@@ -434,7 +414,6 @@ def main():
         model.llm.model = get_peft_model(model.llm.model, peft_config)
         
     if rank == 0: print(f">>> Loading Checkpoint: {args.checkpoint}")
-    # 允许部分权重不匹配 (比如 LoRA 权重覆盖)
     model.load_state_dict(torch.load(args.checkpoint, map_location=device), strict=False)
     
     ds = ExamChatTSDataset(
@@ -452,13 +431,23 @@ def main():
     if args.num_gen_samples == -1: max_samples = None
 
     if rank == 0:
-        mode_str = "Chain-of-Thought (Analysis First)" if args.enable_cot else "Direct Answer (Constraint Decoding)"
+        mode_str = "Chain-of-Thought" if args.enable_cot else "Direct Answer"
+        ablation_str = []
+        if args.mask_query: ablation_str.append("Mask Query")
+        if args.mask_detail: ablation_str.append("Mask Detail")
+        if args.mask_text_stats: ablation_str.append("Mask Text Stats")
+        ablation_info = ", ".join(ablation_str) if ablation_str else "None"
+        
         print(f">>> Inference Mode: {mode_str}")
+        print(f">>> Ablation Mode: {ablation_info}")
 
     generate_predictions(
         model, loader, device, args.output_file, rank, 
         max_samples=max_samples,
-        enable_cot=args.enable_cot # 传递 CoT 参数
+        enable_cot=args.enable_cot,
+        mask_query=args.mask_query,
+        mask_detail=args.mask_detail,
+        mask_text_stats=args.mask_text_stats
     )
     
     if dist.is_initialized(): dist.barrier()
@@ -476,7 +465,6 @@ def main():
         
         print(f">>> Total Samples Generated: {len(merged_results)}")
         
-        # 使用正则评估
         final_scored_results = evaluate_exam_results_with_regex(merged_results)
         
         with open(args.output_file, 'w', encoding='utf-8') as f:

@@ -161,14 +161,16 @@ class PatchTSTEncoder(nn.Module):
         for p in self.parameters():
             p.requires_grad_(False)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         if self.config.freeze_patch_encoder:
             with torch.no_grad():
                 emb = self.embedding(x)
-                return self.encoder(emb)
+                enc_out = self.encoder(emb)
+                return emb, enc_out 
         else:
             emb = self.embedding(x)
-            return self.encoder(emb)
+            enc_out = self.encoder(emb)
+            return emb, enc_out 
 
 
 class QFormer(nn.Module):
@@ -275,14 +277,44 @@ class QFormer(nn.Module):
 
 
 class DetailProjection(nn.Module):
-    """模块 III 分支 B：局部细节投影。"""
+    """
+    [升级] 模块 III 分支 B：局部细节投影 (3-Layer MLP)。
+    用于将原始的 Shallow Patch 特征映射到 LLM 语义空间。
+    结构：Dim -> 4*Dim -> 4*Dim -> Dim
+    """
     def __init__(self, config: CROMEConfig):
         super().__init__()
-        self.proj = nn.Linear(config.patch_embedding_dim, config.patch_embedding_dim)
+        
+        # 输入和输出维度都是 patch_embedding_dim
+        dim = config.patch_embedding_dim
+        hidden_dim = dim * 4  # 中间层扩维以增加表达能力
+        
+        # 3层 MLP 结构
+        self.proj = nn.Sequential(
+            # 第一层：升维 + 激活
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            
+            # 第二层：特征变换 + 激活 (深度的来源)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            
+            # 第三层：降维回目标空间
+            nn.Linear(hidden_dim, dim)
+        )
+        
+        # 初始化策略 (可选，保持默认通常也可以，但 Xavier/Kaiming 有助于深层网络)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, patch_tokens: Tensor) -> Tensor:
         return self.proj(patch_tokens)
-
 
 class RobustFiLMGenerator(nn.Module):
     """
@@ -442,13 +474,17 @@ class CROMETSModel(nn.Module):
         x, stats = self.preprocessor(channel_data)
         gamma, beta = self.film_generator(stats)
         
-        patch_tokens = self.shape_encoder(x)
+        raw_embeds, deep_feats = self.shape_encoder(x)
         
-        # 传入 instruction_embeds 给 QFormer
-        query_tokens = self.qformer(patch_tokens, instruction_embeds)
+        # 1. Q-Former (负责语义): 使用深层特征
+        # 它需要理解 "Periodicity", "Trend" 等抽象概念
+        query_tokens = self.qformer(deep_feats, instruction_embeds)
         
-        detail_tokens = self.detail_proj(patch_tokens)
+        # 2. Detail Projector (负责细节): [核心修改] 改用浅层特征
+        # 直接把“原图”的高频细节透传给 LLM，防止被 Transformer 层磨平
+        detail_tokens = self.detail_proj(raw_embeds) 
         
+        # 3. 融合
         ts_tokens = self.adapter(query_tokens, detail_tokens, gamma=gamma, beta=beta)
         ts_tokens = self.llm_proj(ts_tokens)
         
@@ -465,10 +501,12 @@ class CROMETSModel(nn.Module):
         x, stats = self.preprocessor(raw_series)
         gamma, beta = self.film_generator(stats)
         
-        patch_tokens = self.shape_encoder(x)
-        # 传入 instruction_embeds
-        query_tokens = self.qformer(patch_tokens, instruction_embeds)
-        detail_tokens = self.detail_proj(patch_tokens)
+        # [修改] 接收双流特征
+        raw_embeds, deep_feats = self.shape_encoder(x)
+        
+        # 分流处理
+        query_tokens = self.qformer(deep_feats, instruction_embeds)
+        detail_tokens = self.detail_proj(raw_embeds) # 使用浅层特征
         
         ts_tokens = self.adapter(query_tokens, detail_tokens, gamma=gamma, beta=beta)
         ts_tokens = self.llm_proj(ts_tokens)
@@ -594,16 +632,18 @@ class StatBypassCROMETS1(nn.Module):
                 if ts_tensor.numel() > 0:
                     ts_mean = ts_tensor.mean().item()
                     ts_std = ts_tensor.std().item()
-                    ts_min = ts_tensor.min().item()
-                    ts_max = ts_tensor.max().item()
+                    # ts_min = ts_tensor.min().item()
+                    # ts_max = ts_tensor.max().item()
                 else:
-                    ts_mean = ts_std = ts_min = ts_max = 0.0
+                    ts_mean =ts_min = ts_max=0.0
+                    ts_std = 1.0
                 
                 # === Text Stats Dropout ===
                 if self.training and torch.rand(1).item() < 0.5:
                     stats_str = ""
                 else:
-                    stats_str = f" [Stats: mean={ts_mean:.2f}, std={ts_std:.2f}, min={ts_min:.2f}, max={ts_max:.2f}] "
+                    # [核心修改] 改为 Scale/Offset 模式
+                    stats_str = f" [Scale: {ts_std:.2f}, Offset: {ts_mean:.2f}] "
                 
                 if stats_str:
                     stats_encoded = self.tokenizer([stats_str], device)

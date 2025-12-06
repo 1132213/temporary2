@@ -13,7 +13,7 @@ if project_root_str not in sys.path:
 
 # 引入项目模块
 from src.crome_ts.model import CROMEConfig, StatBypassCROMETS1, get_llm_embed_dim
-from src.crome_ts.data_instruct import ChatTSDataset, chatts_collate_fn
+from src.crome_ts.data_instruct import ChatTSDataset, chatts_collate_fn, WeightedMixingDataset
 from test.common import set_seed
 
 try:
@@ -34,7 +34,8 @@ from tqdm import tqdm
 import logging
 from datetime import datetime
 import math
-import subprocess  # <--- [新增] 引入 subprocess
+import subprocess
+from transformers import get_cosine_schedule_with_warmup
 
 def setup_distributed():
     """初始化分布式训练环境"""
@@ -64,7 +65,6 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 def compute_chatts_loss(model, batch, device):
-    # ... (保持不变) ...
     input_texts = batch["input_texts"]
     timeseries_lists = batch["timeseries_lists"]
     output_texts = batch["output_texts"]
@@ -127,7 +127,6 @@ def compute_chatts_loss(model, batch, device):
     return torch.stack(losses).mean()
 
 def evaluate(model, val_loader, device, rank):
-    # ... (保持不变) ...
     model.eval()
     total_loss = 0
     num_batches = 0
@@ -274,16 +273,63 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
     
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     
-    # 5. 数据加载
+    # 5. 数据加载 (逻辑重构)
+    paths = args.mix_jsonl_paths.split(',')
+    probs = [float(p) for p in args.mix_probs.split(',')]
+    eval_path = args.eval_jsonl_path.strip()
+
     if rank == 0 and logger:
-        logger.info(f">>> Loading ChatTS Dataset from {args.jsonl_path}...")
+        logger.info(f">>> [Dynamic Mixing Mode] Loading {len(paths)} datasets...")
+        logger.info(f"    Paths: {paths}")
+        logger.info(f"    Probs: {probs}")
+        logger.info(f"    Eval Path (for 10% split): {eval_path}")
+
+    sub_datasets = []
+    for p in paths:
+        p = p.strip()
+        # === 修改点 2: 智能切分逻辑 ===
+        # 如果当前路径是验证集来源，则只取前 90% 用于训练
+        # 如果是其他辅助数据集，则取 100% 用于训练 (split_ratio=1.0)
+        current_split_ratio = 0.9 if p == eval_path else 1.0
+        
+        ds = ChatTSDataset(
+            p, 
+            args.seq_len, 
+            input_channels, 
+            split="train", 
+            split_ratio=current_split_ratio, # 传入动态比例
+            patch_stride=args.patch_stride
+        )
+        sub_datasets.append(ds)
+        if rank == 0 and logger:
+            logger.info(f"    Loaded {p}: {len(ds)} samples (Ratio={current_split_ratio})")
+            
+    train_ds = WeightedMixingDataset(sub_datasets, probs, seed=args.seed)
     
-    train_ds = ChatTSDataset(args.jsonl_path, args.seq_len, input_channels, split="train", patch_stride=args.patch_stride)
-    val_ds = ChatTSDataset(args.jsonl_path, args.seq_len, input_channels, split="val", patch_stride=args.patch_stride)
+    # 构建 lengths 属性供 DistributedLengthGroupedSampler 使用
+    if rank == 0 and logger:
+        logger.info(">>> Constructing lengths for mixed dataset...")
+    # train_ds.lengths = [train_ds.datasets[ds_idx].lengths[real_idx] for (ds_idx, real_idx) in train_ds.mapping]
+
+    # === 修改点 3: 验证集加载 ===
+    # 强制从 eval-jsonl-path 加载后 10%
+    if rank == 0 and logger:
+        logger.info(f">>> Loading Validation Set (last 10%) from {eval_path}...")
     
-    train_sampler = DistributedLengthGroupedSampler(
-        train_ds, batch_size=args.batch_size, world_size=world_size, rank=rank, shuffle=True, seed=args.seed
+    val_ds = ChatTSDataset(
+        eval_path, 
+        args.seq_len, 
+        input_channels, 
+        split="val", 
+        split_ratio=0.9, # 对应 train 的 0.9，这里取剩余的 0.1
+        patch_stride=args.patch_stride
     )
+    train_sampler = DistributedSampler(
+        train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed
+    ) if world_size > 1 else None
+    # train_sampler = DistributedLengthGroupedSampler(
+    #     train_ds, batch_size=args.batch_size, world_size=world_size, rank=rank, shuffle=True, seed=args.seed
+    # )
     
     val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
     
@@ -297,9 +343,22 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         collate_fn=chatts_collate_fn, num_workers=args.num_workers, drop_last=True, pin_memory=True
     )
     
-    steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
-    scheduler = OneCycleLR(
-        optimizer, max_lr=args.lr, steps_per_epoch=steps_per_epoch, epochs=args.epochs, pct_start=0.1, div_factor=25.0
+    # 1. 计算总优化步数
+    num_update_steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+    max_train_steps = args.epochs * num_update_steps_per_epoch
+    
+    # 2. 计算预热步数
+    warmup_steps = int(max_train_steps * 0.02)
+    if rank == 0 and logger:
+        logger.info(f">>> Scheduler: Cosine with Warmup")
+        logger.info(f">>> Total Optimization Steps: {max_train_steps}")
+        logger.info(f">>> Warmup Steps: {warmup_steps} (Ratio: 0.02)")
+
+    # 3. 初始化调度器
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_train_steps
     )
     
     # 6. 训练循环
@@ -309,6 +368,8 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        if hasattr(train_ds, 'set_epoch'):
+            train_ds.set_epoch(epoch)
         
         model.train()
         train_loss_sum = 0
@@ -378,67 +439,24 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
             torch.save(filtered_state_dict, save_path)
             if logger:
                 logger.info(f">>> Best ChatTS Alignment Model saved to: {save_path}")
-            
-            # =================================================================
-            # ✨ 核心修复：单卡独立子进程评测
-            # =================================================================
-            # if args.eval_jsonl_path:
-            #     logger.info(f">>> [Auto-Eval] Triggering evaluation for Epoch {epoch+1}...")
-            #     eval_log_name = f"eval_result_epoch{epoch+1}_{args.model_suffix}.jsonl"
-            #     eval_output_path = project_root / "log" / eval_log_name
-                
-            #     cmd = [
-            #         sys.executable, "train/test_exam_stage2.py",
-            #         "--jsonl-path", args.eval_jsonl_path,
-            #         "--checkpoint", str(save_path),
-            #         "--output-file", str(eval_output_path),
-            #         "--llm-model-path", args.llm_model_path,
-            #         "--seq-len", str(args.seq_len),
-            #         "--patch-len", str(args.patch_len),
-            #         "--patch-stride", str(args.patch_stride),
-            #         "--num-gen-samples", str(args.eval_num_samples),
-            #     ]
-                
-            #     try:
-            #         clean_env = os.environ.copy()
-            #         for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"]:
-            #             clean_env.pop(key, None)
-                    
-            #         result = subprocess.run(
-            #             cmd, 
-            #             env=clean_env, 
-            #             capture_output=True, 
-            #             text=True
-            #         )
-                    
-            #         if result.returncode == 0:
-            #             logger.info(">>> [Auto-Eval] Finished successfully.")
-            #             # 将评测结果表格打印到主日志中
-            #             logger.info("\n" + "="*30 + f" EVAL REPORT (Epoch {epoch+1}) " + "="*30)
-            #             logger.info(result.stdout)
-            #             logger.info("="*80)
-            #         else:
-            #             logger.error(f">>> [Auto-Eval] Failed with return code {result.returncode}")
-            #             logger.error(f"Stderr: {result.stderr}")
-                        
-            #     except Exception as e:
-            #         logger.error(f">>> [Auto-Eval] Exception launching evaluation: {e}")
-            # =================================================================
         
         if dist.is_initialized():
             dist.barrier()
 
     if rank == 0 and logger:
         logger.info(">>> ChatTS Alignment Training Completed!")
+
 def main():
     parser = argparse.ArgumentParser(description="ChatTS 格式数据 - Stage 2 多卡对齐训练 (FiLM Enhanced)")
-    parser.add_argument("--jsonl-path", type=str, required=True, help="训练数据路径")
     
-    # === 新增评测参数 ===
-    parser.add_argument("--eval-jsonl-path", type=str, default="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.json", help="[可选] 自动评测用的测试集路径")
-    parser.add_argument("--eval-num-samples", type=int, default=746, help="自动评测生成的样本数量")
-    # =================
+    # === 修改点 1: 参数定义 ===
+    # 弃用 --jsonl-path, 改为必须使用 mix 和 eval
+    parser.add_argument("--mix-jsonl-paths", type=str, required=True, help="逗号分隔的多个训练数据路径")
+    parser.add_argument("--mix-probs", type=str, required=True, help="逗号分隔的混合概率")
+    parser.add_argument("--eval-jsonl-path", type=str, required=True, help="用于验证的数据集路径 (将从中切分 10% 作为验证集)")
     
+    # 其他参数保持不变 ...
+    parser.add_argument("--eval-num-samples", type=int, default=746)
     parser.add_argument("--pretrained-encoder-path", type=str, default="model/patchtst_pretrained_full_3b.pth")
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--patch-len", type=int, default=16)

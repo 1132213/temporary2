@@ -19,25 +19,26 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="8"
+LAST_MODEL="16"
 # MODEL_SUFFIX=$LAST_MODEL
-MODEL_SUFFIX="7b_tattn_8"
+MODEL_SUFFIX="8b_tattn_16_skip_new"
 
 # JSONL_PATH="/root/emhua/btwu/timedataset/ChatTS-Training-Dataset/align_256/train_cleaned_2w.jsonl"
 JSONL_PATH="/mnt/shared-storage-user/huaermo/code/test_wbt2/alignment.jsonl"
 # PRETRAINED_PATH="model/encoder.pth"
 PRETRAINED_PATH="model/encoder_$LAST_MODEL.pth"
+LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
 # LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-3B-Instruct"
-LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-7B-Instruct"
+# LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-7B-Instruct"
 
 # 训练超参数
 BATCH_SIZE=2          # 每个GPU的批次大小
 GRAD_ACCUM=16          # 梯度累积步数
 EPOCHS=3
-LR=5e-4
+LR=1e-3
 SEQ_LEN=1024
-PATCH_LEN=8
-PATCH_STRIDE=8
+PATCH_LEN=16
+PATCH_STRIDE=16
 WEIGHT_DECAY=0.01
 # PATCH_STRIDE=8
 

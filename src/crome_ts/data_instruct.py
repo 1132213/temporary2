@@ -465,3 +465,100 @@ def chatts_collate_fn(batch):
         "timeseries_lists": timeseries_lists,
         "output_texts": output_texts,
     }
+
+class WeightedMixingDataset(Dataset):
+    """
+    支持按概率动态混合多个 Map-style 数据集的包装器。
+    
+    原理：
+    1. 根据 probs 计算每个数据集应该贡献的样本数量。
+    2. 生成一个全局的索引映射表 (virtual_index -> (dataset_idx, sample_idx))。
+    3. 支持过采样 (Oversampling) 和欠采样 (Undersampling)。
+    """
+    def __init__(self, datasets: List[Dataset], probs: List[float], epoch_len: int = None, seed: int = 42):
+        super().__init__()
+        assert len(datasets) == len(probs), "数据集数量与概率数量必须一致"
+        self.base_seed = seed
+        # 归一化概率
+        total_prob = sum(probs)
+        self.probs = [p / total_prob for p in probs]
+        self.datasets = datasets
+        
+        # 确定 Epoch 长度
+        # 如果未指定，默认长度为：所有子数据集长度之和 (保持总样本量大概一致)
+        if epoch_len is None:
+            self.length = sum([len(d) for d in datasets])
+        else:
+            self.length = epoch_len
+            
+        self.mapping = self._build_mapping(seed)
+        
+        print(f"Initialized MixingDataset with {len(datasets)} sources.")
+        print(f"Total Virtual Length: {self.length}")
+        for i, p in enumerate(self.probs):
+            print(f"  - Dataset {i}: Weight {p:.2f} | Contribution ~{int(self.length * p)} samples")
+
+    def _build_mapping(self, seed):
+        """
+        构建虚拟索引到物理索引的映射表。
+        保证确定性，以便所有 DDP 进程看到相同的 'epoch' 视图。
+        """
+        # 1. 确定每个数据集需要贡献多少样本
+        counts = [int(self.length * p) for p in self.probs]
+        # 修正舍入误差，把剩余名额补给概率最大的数据集
+        diff = self.length - sum(counts)
+        if diff > 0:
+            max_p_idx = np.argmax(self.probs)
+            counts[max_p_idx] += diff
+            
+        # 2. 生成由 dataset_idx 组成的列表 [0, 0, ..., 1, 1, ..., 2, 2]
+        source_indices = []
+        for ds_idx, count in enumerate(counts):
+            source_indices.extend([ds_idx] * count)
+            
+        # 3. 打乱 dataset 来源顺序 (确定性)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(source_indices)
+        
+        # 4. 为每个 dataset 分配具体的 sample_idx
+        # 我们对每个子数据集生成一个无限循环的打乱索引迭代器
+        iterators = []
+        for ds in self.datasets:
+            # 生成该数据集的一个全排列索引
+            indices = np.arange(len(ds))
+            rng.shuffle(indices)
+            iterators.append(indices)
+            
+        # 指针记录每个数据集用到哪了
+        pointers = [0] * len(self.datasets)
+        
+        final_mapping = []
+        for ds_idx in source_indices:
+            # 获取对应数据集的下一个样本索引
+            # 如果用完了，就循环回到开头 (Oversampling)
+            local_ptr = pointers[ds_idx]
+            if local_ptr >= len(self.datasets[ds_idx]):
+                # 重新打乱 (可选，这里为了简单直接取模)
+                real_idx = iterators[ds_idx][local_ptr % len(self.datasets[ds_idx])]
+            else:
+                real_idx = iterators[ds_idx][local_ptr]
+            
+            pointers[ds_idx] += 1
+            final_mapping.append((ds_idx, real_idx))
+            
+        return final_mapping
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        ds_idx, real_idx = self.mapping[idx]
+        return self.datasets[ds_idx][real_idx]
+    def set_epoch(self, epoch: int):
+        """
+        在每个 Epoch 开始时调用，重新生成随机映射。
+        这能保证如果存在欠采样，每个 Epoch 能看到不同的数据子集。
+        """
+        print(f"Refreshed WeightedMixingDataset mapping for epoch {epoch}")
+        # 使用 base_seed + epoch 作为新种子，保证确定性但每轮不同
+        self.mapping = self._build_mapping(self.base_seed + epoch)

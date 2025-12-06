@@ -20,6 +20,9 @@
 
 # 可视化结果文件夹
 vis_results/
+commands/
+scripts/
+
 
 # Python 缓存文件
 __pycache__/
