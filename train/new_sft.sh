@@ -28,7 +28,6 @@ TEST_EXAM_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/sft.jsonl"
 MIX_PATHS="$SFT_DATA,$IFT_DATA,$ALIGN_DATA"
 MIX_PROBS="0.6,0.1,0.3"
 
-# === 关键修改：指定验证集来源 ===
 # 代码将从 SFT_DATA 切出 10% 做 Loss 验证，IFT 和 ALIGN 将 100% 参与训练
 EVAL_DATA="$SFT_DATA"
 

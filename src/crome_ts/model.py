@@ -185,7 +185,6 @@ class QFormer(nn.Module):
         super().__init__()
         self.config = config
         
-        # [新增] 获取 Dropout 率，优先从 config 读取，默认为 0.1
         dropout_rate = getattr(config, "dropout", 0.1)
         
         # 1. 可学习的 Query Tokens (Base Queries)
@@ -194,11 +193,9 @@ class QFormer(nn.Module):
         )
         
         # 2. 文本交互层 (Text Interaction)
-        # 将 LLM Embedding (如 4096) 投影到 Patch 维度 (如 512)
         self.text_proj = nn.Linear(config.llm_embed_dim, config.patch_embedding_dim)
         
         # Cross-Attention: Query 关注 Text
-        # [修改] 启用 dropout
         self.text_attn = nn.MultiheadAttention(
             embed_dim=config.patch_embedding_dim,
             num_heads=config.patch_num_heads,
@@ -209,7 +206,6 @@ class QFormer(nn.Module):
 
         # 3. 时序提取层 (Time-Series Extraction)
         # Cross-Attention: Query 关注 TS Patch
-        # [修改] 启用 dropout
         self.ts_attn = nn.MultiheadAttention(
             embed_dim=config.patch_embedding_dim,
             num_heads=config.patch_num_heads,
@@ -218,14 +214,11 @@ class QFormer(nn.Module):
         )
         self.ln_ts = nn.LayerNorm(config.patch_embedding_dim)
         
-        # [新增] 通用 Dropout 层
         self.dropout = nn.Dropout(dropout_rate)
 
-        # 初始化投影层
         nn.init.zeros_(self.text_proj.weight)
         nn.init.zeros_(self.text_proj.bias)
 
-        # 用于存储可视化权重
         self.last_text_attn_weights = None
 
     def forward(self, patch_tokens: Tensor, instruction_embeds: Optional[Tensor] = None) -> Tensor:
@@ -248,18 +241,17 @@ class QFormer(nn.Module):
             text_kv = self.text_proj(instruction_embeds) # [B, Text_Len, D]
             
             # (C) Cross-Attention: Q=Queries, K=Text, V=Text
-            # [修改] 获取 Attention 权重
             text_out, attn_weights = self.text_attn(
                 query=queries,
                 key=text_kv,
                 value=text_kv
             )
             
-            # [新增] 保存权重供可视化 (Detach + CPU 以节省显存)
+            # 保存权重供可视化 (Detach + CPU 以节省显存)
             # 形状通常为 [Batch, Queries, Text_Len] (若 average_attn_weights=True)
             self.last_text_attn_weights = attn_weights.detach().cpu()
             
-            # (D) 残差 + Norm + [新增] Dropout
+            # (D) 残差 + Norm + Dropout
             # 注意：这里采用了 Pre-Norm 或 Post-Norm 结构均可，这里维持原有的 Post-Norm 逻辑
             # Query = Norm(Query + Dropout(Attn(Q, Text)))
             queries = self.ln_text(queries + self.dropout(text_out))
@@ -272,13 +264,13 @@ class QFormer(nn.Module):
             value=patch_tokens
         )
         
-        # [修改] 输出前应用 Dropout
+        # 输出前应用 Dropout
         return self.ln_ts(self.dropout(ts_out))
 
 
 class DetailProjection(nn.Module):
     """
-    [升级] 模块 III 分支 B：局部细节投影 (3-Layer MLP)。
+    模块 III 分支 B：局部细节投影 (3-Layer MLP)。
     用于将原始的 Shallow Patch 特征映射到 LLM 语义空间。
     结构：Dim -> 4*Dim -> 4*Dim -> Dim
     """
@@ -501,7 +493,7 @@ class CROMETSModel(nn.Module):
         x, stats = self.preprocessor(raw_series)
         gamma, beta = self.film_generator(stats)
         
-        # [修改] 接收双流特征
+        #  接收双流特征
         raw_embeds, deep_feats = self.shape_encoder(x)
         
         # 分流处理
@@ -578,7 +570,7 @@ class StatBypassCROMETS1(nn.Module):
             text_parts = input_text.split(ts_marker)
             
             # =================================================================
-            # [新增] 拼接所有文本片段作为全局指令 (Fix from discussion)
+            #  拼接所有文本片段作为全局指令 (Fix from discussion)
             # =================================================================
             full_instruction_text = " ".join([p.strip() for p in text_parts if p.strip()])
             
