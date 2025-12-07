@@ -216,8 +216,11 @@ class QFormer(nn.Module):
         
         self.dropout = nn.Dropout(dropout_rate)
 
-        nn.init.zeros_(self.text_proj.weight)
-        nn.init.zeros_(self.text_proj.bias)
+        # nn.init.zeros_(self.text_proj.weight)
+        # nn.init.zeros_(self.text_proj.bias)
+        nn.init.xavier_uniform_(self.text_proj.weight)
+        if self.text_proj.bias is not None:
+            nn.init.zeros_(self.text_proj.bias)
 
         self.last_text_attn_weights = None
 
