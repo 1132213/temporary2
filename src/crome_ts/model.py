@@ -101,29 +101,29 @@ class InputPreprocessor(nn.Module):
         super().__init__()
         self.config = config
         self.revin = RevIN(config.epsilon)
-        self.pos_encoding = FixedSinePositionalEncoding(config.input_channels)
-        self.fuse_mode = config.fuse_mode
+        # self.pos_encoding = FixedSinePositionalEncoding(config.input_channels)
+        # self.fuse_mode = config.fuse_mode
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         b, l, c = x.shape
         x_norm, stats = self.revin(x)
+        return x_norm,stats
+        # if c != self.config.input_channels:
+        #     pos_encoding = FixedSinePositionalEncoding(c)
+        # else:
+        #     pos_encoding = self.pos_encoding
         
-        if c != self.config.input_channels:
-            pos_encoding = FixedSinePositionalEncoding(c)
-        else:
-            pos_encoding = self.pos_encoding
+        # time_emb = pos_encoding(l, device=x.device, dtype=x.dtype)
+        # time_emb = time_emb.unsqueeze(0).expand(b, -1, -1)
         
-        time_emb = pos_encoding(l, device=x.device, dtype=x.dtype)
-        time_emb = time_emb.unsqueeze(0).expand(b, -1, -1)
-        
-        if self.fuse_mode == "add":
-            fused = x_norm + time_emb
-        elif self.fuse_mode == "concat":
-            fused = torch.cat([x_norm, time_emb], dim=-1)
-        else:
-            raise ValueError(f"未知融合模式: {self.fuse_mode}")
+        # if self.fuse_mode == "add":
+        #     fused = x_norm + time_emb
+        # elif self.fuse_mode == "concat":
+        #     fused = torch.cat([x_norm, time_emb], dim=-1)
+        # else:
+        #     raise ValueError(f"未知融合模式: {self.fuse_mode}")
             
-        return fused, stats
+        # return fused, stats
 
 
 class PatchEmbedding(nn.Module):
@@ -148,6 +148,10 @@ class PatchTSTEncoder(nn.Module):
         super().__init__()
         self.config = config 
         self.embedding = PatchEmbedding(config, input_dim)
+        self.pos_encoding = FixedSinePositionalEncoding(
+            dim=config.patch_embedding_dim, 
+            scale=10000.0
+        )
         layer = nn.TransformerEncoderLayer(
             d_model=config.patch_embedding_dim,
             nhead=config.patch_num_heads,
@@ -162,13 +166,28 @@ class PatchTSTEncoder(nn.Module):
             p.requires_grad_(False)
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        # x: [Batch, Seq_Len, Channels]
+        
+        # 1. Patchify & Project
+        # emb: [Batch, Num_Patches, Patch_Dim]
+        emb = self.embedding(x) 
+        
+        # 2. [核心修改] 动态生成 Patch 级位置编码
+        # 获取当前的 patch 数量
+        b, num_patches, d = emb.shape
+        
+        # 生成对应的 PE: [Num_Patches, Patch_Dim]
+        # 注意：这里传入的是 num_patches，代表“第几个Patch”，而不是“第几秒”
+        pe = self.pos_encoding(num_patches, device=x.device, dtype=emb.dtype)
+        
+        # 广播并相加: [1, N, D] + [B, N, D]
+        emb = emb + pe.unsqueeze(0)
+
         if self.config.freeze_patch_encoder:
             with torch.no_grad():
-                emb = self.embedding(x)
                 enc_out = self.encoder(emb)
                 return emb, enc_out 
         else:
-            emb = self.embedding(x)
             enc_out = self.encoder(emb)
             return emb, enc_out 
 
