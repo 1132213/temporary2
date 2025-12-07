@@ -22,7 +22,7 @@ IFT_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/ChatTS/ift/train.jsonl
 ALIGN_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/ChatTS/align_random/train.jsonl"
 
 # 自动评测脚本用的测试集 (如果需要)
-TEST_EXAM_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/sft.jsonl" 
+TEST_EXAM_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.jsonl" 
 
 # 混合配置
 MIX_PATHS="$SFT_DATA,$IFT_DATA,$ALIGN_DATA"

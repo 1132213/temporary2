@@ -64,11 +64,14 @@ def exam_collate_fn(batch):
 # ==========================================
 def build_chatts_embeddings_for_inference(
     model, input_text, ts_list, device, 
-    mask_query=False, mask_detail=False,mask_text_stats=False
+    mask_query=False, mask_detail=False
 ):
     """
     构建推理用的 Embeddings。
-    支持 Text-Guided Q-Former 和 特征消融 (Ablation)。
+    同步了 model.py 中的最新架构变更：
+    1. 特殊 Token: <|ts_start|>, <|ts_end|>, <|feat_sep|>
+    2. Stats 格式: Scale/Offset
+    3. 特征结构: [Start] [Query, Sep, Detail] [End]
     """
     ts_marker = "<ts><ts/>"
     text_parts = input_text.split(ts_marker)
@@ -96,79 +99,101 @@ def build_chatts_embeddings_for_inference(
     elif len(timeseries_list) > num_markers:
         timeseries_list = timeseries_list[:num_markers]
         
-    segment_embeds, segment_masks = [], []
+    segment_embeds = []
+    segment_masks = []
     tokenizer = model.tokenizer.tokenizer
-    target_dtype = next(model.llm.parameters()).dtype
+    
+    # 获取目标数据类型 (bfloat16/float32)
+    target_dtype = model.llm.model.dtype
+    
+    # [新增] 获取特殊 Token (保持与 model.py 一致)
+    # 注意：model.ts_start_token 是 Parameter, shape [1, 1, Dim] 或 [1, Dim]
+    # 我们这里统一转为 [Dim] 方便 list append
+    start_token = model.ts_start_token.data.to(dtype=target_dtype, device=device).squeeze()
+    end_token   = model.ts_end_token.data.to(dtype=target_dtype, device=device).squeeze()
+    sep_token   = model.feat_sep_token.data.to(dtype=target_dtype, device=device) # 传给 adapter 不需要 squeeze
     
     # 1. Prefix Text
     if text_parts[0]:
         tokens = tokenizer(text_parts[0], return_tensors="pt", add_special_tokens=False).to(device)
-        segment_embeds.append(model.llm.embed(tokens.input_ids)[0])
+        emb = model.llm.embed(tokens.input_ids)[0].to(target_dtype)
+        segment_embeds.append(emb)
         segment_masks.append(tokens.attention_mask[0])
     
     # 2. TS + Middle Text
     for idx, ts in enumerate(timeseries_list):
         ts = ts.to(device)
         
-        if not mask_text_stats:
-            if ts.numel() > 0:
-                ts_mean = ts.mean().item()
-                ts_std = ts.std().item()
-                ts_min = ts.min().item()
-                ts_max = ts.max().item()
-            else:
-                ts_mean = ts_std = ts_min = ts_max = 0.0
-                
-            stats_str = f" [Scale: {ts_std:.2f}, Offset: {ts_mean:.2f}] "
+        # [修改] Stats 格式同步为 Scale/Offset
+        if ts.numel() > 0:
+            ts_mean = ts.mean().item()
+            ts_std = ts.std().item()
+        else:
+            ts_mean = 0.0
+            ts_std = 1.0
             
-            stats_tokens = tokenizer(stats_str, return_tensors="pt", add_special_tokens=False).to(device)
-            segment_embeds.append(model.llm.embed(stats_tokens.input_ids)[0])
-            segment_masks.append(stats_tokens.attention_mask[0])
+        # 训练时我们用了 Scale/Offset，推理时也要保持一致
+        # 即使训练时有 50% Dropout，测试时通常给出完整信息以获得最佳性能
+        stats_str = f" [Scale: {ts_std:.2f}, Offset: {ts_mean:.2f}] "
         
         # --- 时序特征提取 ---
         ts_batch = ts.unsqueeze(0)
         
+        # [修改] 传入 sep_embed，让 Adapter 内部完成拼接 [Query, Sep, Detail]
         ts_tokens = model.ts_model._process_single_channel(
             ts_batch, 
-            instruction_embeds=current_instruction_embeds
+            instruction_embeds=current_instruction_embeds,
+            sep_embed=sep_token
         )
         
-        # =================== [新增] 消融逻辑 (Masking) ===================
+        # Ablation Masking (如果需要)
         if mask_query or mask_detail:
-            # ts_tokens shape: [1, N_tokens, Dim]
-            # 结构: [Query Tokens (32) | Detail Tokens (N)]
+            # 这里的结构现在是 [Query (32) | Sep (1) | Detail (N)]
+            # 需要小心处理索引
             num_q = model.config.query_tokens
-            
             if mask_query:
-                # 将前 num_q 个 token 置零
                 ts_tokens[:, :num_q, :] = 0.0
-            
             if mask_detail:
-                # 将 num_q 之后的 token 置零
-                ts_tokens[:, num_q:, :] = 0.0
-        # ================================================================
+                # Detail 从 num_q + 1 开始 (跳过中间的 Sep)
+                ts_tokens[:, num_q+1:, :] = 0.0
         
         if ts_tokens.dtype != target_dtype: 
             ts_tokens = ts_tokens.to(dtype=target_dtype)
 
-        ts_emb = ts_tokens[0]
+        ts_emb = ts_tokens[0] # [Len, Dim]
         
+        # [修改] 组装三明治结构: [Start] + [TS] + [End]
+        
+        # A. Start Token
+        segment_embeds.append(start_token.unsqueeze(0)) # [1, Dim]
+        segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
+        
+        # B. TS Feature
         segment_embeds.append(ts_emb)
         segment_masks.append(torch.ones(ts_emb.shape[0], device=device, dtype=torch.long))
         
-        # 添加 SEP
+        # C. End Token
+        segment_embeds.append(end_token.unsqueeze(0))   # [1, Dim]
+        segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
+        
+        # D. Stats Text (紧跟在 End Token 之后)
+        stats_tokens = tokenizer(stats_str, return_tensors="pt", add_special_tokens=False).to(device)
+        stats_emb = model.llm.embed(stats_tokens.input_ids)[0].to(target_dtype)
+        segment_embeds.append(stats_emb)
+        segment_masks.append(stats_tokens.attention_mask[0])
+        
+        # E. 多序列分隔符 (保留，用于分隔不同序列的文本描述)
         if idx < len(timeseries_list) - 1:
-            sep_embed = model.sep_token
-            if sep_embed.dtype != target_dtype: 
-                sep_embed = sep_embed.to(dtype=target_dtype)
-            segment_embeds.append(sep_embed)
+            sep_embed = model.sep_token.data.to(dtype=target_dtype, device=device).squeeze()
+            segment_embeds.append(sep_embed.unsqueeze(0))
             segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
             
         # Middle Text
         txt_idx = idx + 1
         if txt_idx < len(text_parts) and text_parts[txt_idx]:
             tokens = tokenizer(text_parts[txt_idx], return_tensors="pt", add_special_tokens=False).to(device)
-            segment_embeds.append(model.llm.embed(tokens.input_ids)[0])
+            emb = model.llm.embed(tokens.input_ids)[0].to(target_dtype)
+            segment_embeds.append(emb)
             segment_masks.append(tokens.attention_mask[0])
             
     if segment_embeds:
