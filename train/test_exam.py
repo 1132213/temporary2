@@ -58,6 +58,14 @@ def exam_collate_fn(batch):
     batch_dict = chatts_collate_fn(batch)
     batch_dict["categories"] = [item["category"] for item in batch]
     return batch_dict
+
+def compute_test_loss(model, dataloader, device, rank):
+    model.eval()
+    return 0.0
+
+# ==========================================
+# 3. 生成预测 (支持 CoT, Direct, Ablation)
+# ==========================================
 def generate_predictions(
     model, dataloader, device, output_file, rank, 
     max_samples=None, enable_cot=False,
@@ -100,19 +108,18 @@ def generate_predictions(
 
                 try:
                     # ========================================================
-                    # [关键修改]：直接调用 model.generate
-                    # 不再需要手动构建 embeddings 和 mask
+                    # [关键修改]：将 mask 参数传递给 model.generate
                     # ========================================================
-                    
-                    # 注意：为了兼容你的 Ablation 实验 (mask_query 等参数)
-                    # 你需要在 model.py 的 prepare_multimodal_embeds 中也加上这些参数
-                    # 或者在这里为了跑通基础流程，我们先只调用基础生成：
-                    
                     outs = model.generate(
-                        input_texts=[full_input],       # 传入列表
-                        timeseries_lists=[ts_lists[i]], # 传入列表的列表
+                        input_texts=[full_input],
+                        timeseries_lists=[ts_lists[i]],
                         
-                        # 生成参数透传给底层 LLM
+                        # 透传 Ablation 参数
+                        mask_query=mask_query,
+                        mask_detail=mask_detail,
+                        mask_text_stats=mask_text_stats,
+                        
+                        # 生成参数
                         max_new_tokens=max_new_tokens, 
                         min_new_tokens=1,   
                         pad_token_id=tokenizer.pad_token_id, 
@@ -123,7 +130,7 @@ def generate_predictions(
                     
                     pred = tokenizer.decode(outs[0], skip_special_tokens=True)
                     
-                    # --- 后处理 (保持不变) ---
+                    # --- 后处理 ---
                     stop_words = ["<|im_end|>", "<|im_start|>", "user", "model"]
                     for stop_word in stop_words:
                         idx = pred.find(stop_word)
@@ -140,12 +147,11 @@ def generate_predictions(
                         "prediction": pred,
                         "category": cats[i],
                         "mode": "cot" if enable_cot else "direct",
-                        "ablation": f"mask_q={mask_query},mask_d={mask_detail}"
+                        "ablation": f"mask_q={mask_query},mask_d={mask_detail},mask_s={mask_text_stats}"
                     })
                     sample_count += 1
                 except Exception as e:
                     print(f"[Rank {rank}] Gen Error: {e}")
-                    # 打印详细堆栈以便调试
                     import traceback
                     traceback.print_exc()
                     continue
@@ -153,246 +159,6 @@ def generate_predictions(
     temp_file = f"{output_file}.rank{rank}"
     with open(temp_file, 'w', encoding='utf-8') as f:
         for res in results: f.write(json.dumps(res, ensure_ascii=False) + "\n")
-def compute_test_loss(model, dataloader, device, rank):
-    model.eval()
-    return 0.0
-# ==========================================
-# 2. Embedding 构建 (含 Text-Guided & Ablation)
-# ==========================================
-# def build_chatts_embeddings_for_inference(
-#     model, input_text, ts_list, device, 
-#     mask_query=False, mask_detail=False
-# ):
-#     """
-#     构建推理用的 Embeddings。
-#     同步了 model.py 中的最新架构变更：
-#     1. 特殊 Token: <|ts_start|>, <|ts_end|>, <|feat_sep|>
-#     2. Stats 格式: Scale/Offset
-#     3. 特征结构: [Start] [Query, Sep, Detail] [End]
-#     """
-#     ts_marker = "<ts><ts/>"
-#     text_parts = input_text.split(ts_marker)
-#     num_markers = len(text_parts) - 1
-#     timeseries_list = list(ts_list)
-    
-#     # 提取并编码全局指令 (Text-Guided)
-#     full_instruction_text = " ".join([p.strip() for p in text_parts if p.strip()])
-    
-#     current_instruction_embeds = None
-#     if full_instruction_text:
-#         instr_encoded = model.tokenizer.tokenizer(
-#             full_instruction_text, 
-#             return_tensors="pt", 
-#             add_special_tokens=True,
-#             truncation=True,
-#             max_length=1024 
-#         ).to(device)
-#         current_instruction_embeds = model.llm.embed(instr_encoded["input_ids"])
-
-#     # 填充缺失的时间序列占位符
-#     if len(timeseries_list) < num_markers:
-#         for _ in range(num_markers - len(timeseries_list)):
-#             timeseries_list.append(torch.zeros(model.config.seq_len, model.config.input_channels, device=device))
-#     elif len(timeseries_list) > num_markers:
-#         timeseries_list = timeseries_list[:num_markers]
-        
-#     segment_embeds = []
-#     segment_masks = []
-#     tokenizer = model.tokenizer.tokenizer
-    
-#     # 获取目标数据类型 (bfloat16/float32)
-#     target_dtype = model.llm.model.dtype
-    
-#     # [新增] 获取特殊 Token (保持与 model.py 一致)
-#     # 注意：model.ts_start_token 是 Parameter, shape [1, 1, Dim] 或 [1, Dim]
-#     # 我们这里统一转为 [Dim] 方便 list append
-#     start_token = model.ts_start_token.data.to(dtype=target_dtype, device=device).squeeze()
-#     end_token   = model.ts_end_token.data.to(dtype=target_dtype, device=device).squeeze()
-#     sep_token   = model.feat_sep_token.data.to(dtype=target_dtype, device=device) # 传给 adapter 不需要 squeeze
-    
-#     # 1. Prefix Text
-#     if text_parts[0]:
-#         tokens = tokenizer(text_parts[0], return_tensors="pt", add_special_tokens=False).to(device)
-#         emb = model.llm.embed(tokens.input_ids)[0].to(target_dtype)
-#         segment_embeds.append(emb)
-#         segment_masks.append(tokens.attention_mask[0])
-    
-#     # 2. TS + Middle Text
-#     for idx, ts in enumerate(timeseries_list):
-#         ts = ts.to(device)
-        
-#         # [修改] Stats 格式同步为 Scale/Offset
-#         if ts.numel() > 0:
-#             ts_mean = ts.mean().item()
-#             ts_std = ts.std().item()
-#         else:
-#             ts_mean = 0.0
-#             ts_std = 1.0
-            
-#         # 训练时我们用了 Scale/Offset，推理时也要保持一致
-#         # 即使训练时有 50% Dropout，测试时通常给出完整信息以获得最佳性能
-#         stats_str = f" [Scale: {ts_std:.2f}, Offset: {ts_mean:.2f}] "
-        
-#         # --- 时序特征提取 ---
-#         ts_batch = ts.unsqueeze(0)
-        
-#         # [修改] 传入 sep_embed，让 Adapter 内部完成拼接 [Query, Sep, Detail]
-#         ts_tokens = model.ts_model._process_single_channel(
-#             ts_batch, 
-#             instruction_embeds=current_instruction_embeds,
-#             sep_embed=sep_token
-#         )
-        
-#         # Ablation Masking (如果需要)
-#         if mask_query or mask_detail:
-#             # 这里的结构现在是 [Query (32) | Sep (1) | Detail (N)]
-#             # 需要小心处理索引
-#             num_q = model.config.query_tokens
-#             if mask_query:
-#                 ts_tokens[:, :num_q, :] = 0.0
-#             if mask_detail:
-#                 # Detail 从 num_q + 1 开始 (跳过中间的 Sep)
-#                 ts_tokens[:, num_q+1:, :] = 0.0
-        
-#         if ts_tokens.dtype != target_dtype: 
-#             ts_tokens = ts_tokens.to(dtype=target_dtype)
-
-#         ts_emb = ts_tokens[0] # [Len, Dim]
-        
-#         # [修改] 组装三明治结构: [Start] + [TS] + [End]
-        
-#         # A. Start Token
-#         segment_embeds.append(start_token.unsqueeze(0)) # [1, Dim]
-#         segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
-
-#         # B. Stats Text (紧跟在 End Token 之后)
-#         stats_tokens = tokenizer(stats_str, return_tensors="pt", add_special_tokens=False).to(device)
-#         stats_emb = model.llm.embed(stats_tokens.input_ids)[0].to(target_dtype)
-#         segment_embeds.append(stats_emb)
-#         segment_masks.append(stats_tokens.attention_mask[0])
-        
-#         # C. TS Feature
-#         segment_embeds.append(ts_emb)
-#         segment_masks.append(torch.ones(ts_emb.shape[0], device=device, dtype=torch.long))
-        
-#         # D. End Token
-#         segment_embeds.append(end_token.unsqueeze(0))   # [1, Dim]
-#         segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
-        
-#         # E. 多序列分隔符 (保留，用于分隔不同序列的文本描述)
-#         if idx < len(timeseries_list) - 1:
-#             sep_embed = model.sep_token.data.to(dtype=target_dtype, device=device).squeeze()
-#             segment_embeds.append(sep_embed.unsqueeze(0))
-#             segment_masks.append(torch.ones(1, device=device, dtype=torch.long))
-            
-#         # Middle Text
-#         txt_idx = idx + 1
-#         if txt_idx < len(text_parts) and text_parts[txt_idx]:
-#             tokens = tokenizer(text_parts[txt_idx], return_tensors="pt", add_special_tokens=False).to(device)
-#             emb = model.llm.embed(tokens.input_ids)[0].to(target_dtype)
-#             segment_embeds.append(emb)
-#             segment_masks.append(tokens.attention_mask[0])
-            
-#     if segment_embeds:
-#         full_emb = torch.cat(segment_embeds, dim=0)
-#         full_msk = torch.cat(segment_masks, dim=0)
-#         return full_emb.unsqueeze(0), full_msk.unsqueeze(0)
-    
-#     return torch.empty(1,0,model.config.llm_embed_dim).to(device), torch.empty(1,0).to(device)
-
-
-
-# # ==========================================
-# # 3. 生成预测 (支持 CoT, Direct, Ablation)
-# # ==========================================
-# def generate_predictions(
-#     model, dataloader, device, output_file, rank, 
-#     max_samples=None, enable_cot=False,
-#     mask_query=False, mask_detail=False,mask_text_stats=False
-# ):
-#     model.eval()
-#     results = []
-#     tokenizer = model.tokenizer.tokenizer
-    
-#     if tokenizer.pad_token_id is None:
-#         tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-#     iterator = tqdm(dataloader, desc=f"Rank {rank} Inference") if rank == 0 else dataloader
-#     sample_count = 0
-
-#     with torch.no_grad():
-#         for batch in iterator:
-#             if max_samples and sample_count >= max_samples: break
-            
-#             input_texts = batch["input_texts"]
-#             ts_lists = batch["timeseries_lists"]
-#             gts = batch["output_texts"]
-#             cats = batch["categories"]
-            
-#             for i in range(len(input_texts)):
-#                 if max_samples and sample_count >= max_samples: break
-                
-#                 original_input = input_texts[i]
-                
-#                 # --- Prompt 构造 ---
-#                 if enable_cot:
-#                     cot_suffix = "\nLet's analyze step by step. At the end, state the answer as 'The answer is <Option>'."
-#                     full_input = f"<|im_start|>user\n{original_input}{cot_suffix}<|im_end|>\n<|im_start|>assistant\n"
-#                     max_new_tokens = 512 
-#                     stop_prefix = None
-#                 else:
-#                     full_input = f"<|im_start|>user\n{original_input}<|im_end|>\n<|im_start|>assistant\nThe answer is option"
-#                     max_new_tokens = 16 
-#                     stop_prefix = "The answer is option" 
-
-#                 try:
-#                     # 传入 mask 参数
-#                     embeds, mask = build_chatts_embeddings_for_inference(
-#                         model, full_input, ts_lists[i], device,
-#                         mask_query=mask_query,
-#                         mask_detail=mask_detail,
-#                         mask_text_stats=mask_text_stats
-#                     )
-                    
-#                     outs = model.llm.model.generate(
-#                         inputs_embeds=embeds, 
-#                         attention_mask=mask,
-#                         max_new_tokens=max_new_tokens, 
-#                         min_new_tokens=1,   
-#                         pad_token_id=tokenizer.pad_token_id, 
-#                         eos_token_id=tokenizer.eos_token_id,
-#                         do_sample=False,
-#                         repetition_penalty=1.1
-#                     )
-#                     pred = tokenizer.decode(outs[0], skip_special_tokens=True)
-                    
-#                     # --- 后处理 ---
-#                     stop_words = ["<|im_end|>", "<|im_start|>", "user", "model"]
-#                     for stop_word in stop_words:
-#                         idx = pred.find(stop_word)
-#                         if idx != -1:
-#                             pred = pred[:idx]
-                    
-#                     if stop_prefix and stop_prefix in pred:
-#                         pred = pred.split(stop_prefix)[-1]
-                    
-#                     pred = pred.strip()
-                    
-#                     results.append({
-#                         "ground_truth": gts[i],
-#                         "prediction": pred,
-#                         "category": cats[i],
-#                         "mode": "cot" if enable_cot else "direct",
-#                         "ablation": f"mask_q={mask_query},mask_d={mask_detail}"
-#                     })
-#                     sample_count += 1
-#                 except Exception as e:
-#                     print(f"[Rank {rank}] Gen Error: {e}")
-#                     continue
-
-#     temp_file = f"{output_file}.rank{rank}"
-#     with open(temp_file, 'w', encoding='utf-8') as f:
-#         for res in results: f.write(json.dumps(res, ensure_ascii=False) + "\n")
 
 # ==========================================
 # 4. 正则表达式判断逻辑
@@ -544,7 +310,6 @@ def main():
         print(f"    - Missing Keys: {len(msg.missing_keys)}")
         print(f"    - Unexpected Keys: {len(msg.unexpected_keys)}")
         
-        # 如果想看具体漏了什么（可选）
         if len(msg.missing_keys) > 0:
             print(f"    ! Warning: First 5 missing keys: {msg.missing_keys[:5]}")
     

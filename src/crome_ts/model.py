@@ -474,7 +474,34 @@ class FrozenLLM(nn.Module):
             attention_mask=attention_mask,
             **kwargs,
         )
+    
+class SeriesDecomp(nn.Module):
+    """
+    序列分解模块：将序列分解为 趋势项(Trend) 和 残差项(Residual)。
+    X_residual = X_input - MovingAvg(X_input)
+    """
+    def __init__(self, kernel_size):
+        super().__init__()
+        self.kernel_size = kernel_size
+        # 使用平均池化实现移动平均
+        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=0)
 
+    def forward(self, x):
+        # x: [Batch, Seq_Len, Channels]
+        
+        # Padding 以保持序列长度不变
+        front = x[:, 0:1, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        end = x[:, -1:, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        x_pad = torch.cat([front, x, end], dim=1)
+        
+        # 计算 Trend
+        # [B, L, C] -> [B, C, L] -> AvgPool -> [B, C, L] -> [B, L, C]
+        x_trend = self.avg(x_pad.permute(0, 2, 1)).permute(0, 2, 1)
+        
+        # 计算 Residual (这就包含了 Noise 和 Anomaly)
+        x_resid = x - x_trend
+        
+        return x_resid, x_trend
 
 class CROMETSModel(nn.Module):
     def __init__(self, config: CROMEConfig):
@@ -491,6 +518,17 @@ class CROMETSModel(nn.Module):
         
         self.film_generator = RobustFiLMGenerator(config)
         self.adapter = CROMEAdapter(config)
+
+        self.decomp = SeriesDecomp(kernel_size=25)
+        self.resid_patch_len = 4  # 使用更小的 Patch
+        self.resid_stride = 4     # 配合 Stride=4 或 2
+        
+        # 独立的线性层，随机初始化
+        self.resid_embedding = nn.Linear(
+            self.resid_patch_len * config.input_channels, 
+            config.patch_embedding_dim
+        )
+        nn.init.xavier_uniform_(self.resid_embedding.weight)
         
         # self.llm_proj = nn.Linear(config.patch_embedding_dim, config.llm_embed_dim)
         self.llm_proj = nn.Sequential(
@@ -499,7 +537,6 @@ class CROMETSModel(nn.Module):
             nn.Dropout(config.proj_dropout),
             nn.Linear(config.llm_embed_dim, config.llm_embed_dim)
         )
-
     def _process_single_channel(
         self,
         channel_data: Tensor,
@@ -508,17 +545,29 @@ class CROMETSModel(nn.Module):
     ) -> Tensor:
         x, stats = self.preprocessor(channel_data)
         gamma, beta = self.film_generator(stats)
+        # 1. 分解
+        x_resid, x_trend = self.decomp(x)
         
-        # 接收双流特征
-        raw_embeds, deep_feats = self.shape_encoder(x)
-        
-        # 1. Q-Former (语义)
+        # 2. 主流 (Query): 看趋势 (Patch=16)
+        raw_embeds_global, deep_feats = self.shape_encoder(x) # 还是喂原始x效果最好
         query_tokens = self.qformer(deep_feats, instruction_embeds)
         
-        # 2. Detail Projector (细节)
-        detail_tokens = self.detail_proj(raw_embeds) 
+        # 3. 辅流 (Detail): 看残差 (Patch=4)
+        # 手动 Patching
+        # [B, L, C] -> [B, N, P, C]
+        resid_patches = x_resid.unfold(dimension=1, size=self.resid_patch_len, step=self.resid_stride)
+        b, n, p, c = resid_patches.shape
+        resid_patches = resid_patches.contiguous().view(b, n, -1)
         
-        # 3. 融合 (传入 sep_embed)
+        # 使用独立 Embedding 层
+        resid_embeds = self.resid_embedding(resid_patches) # [B, N_resid, 512]
+        
+        # 送入 Detail Projector
+        detail_tokens = self.detail_proj(resid_embeds)
+        
+        # 4. 融合
+        # 注意: 此时 detail_tokens 的长度 (N_resid) 是 query_tokens (32) 或原 patch (N_main) 的 4 倍
+        # Adapter 和 LLM 可以处理变长序列，直接拼接即可
         ts_tokens = self.adapter(
             query_tokens, detail_tokens, 
             sep_embed=sep_embed, 
@@ -527,6 +576,33 @@ class CROMETSModel(nn.Module):
         ts_tokens = self.llm_proj(ts_tokens)
         
         return ts_tokens
+    # def _process_single_channel(
+    #     self,
+    #     channel_data: Tensor,
+    #     instruction_embeds: Optional[Tensor] = None,
+    #     sep_embed: Optional[Tensor] = None, # [新增]
+    # ) -> Tensor:
+    #     x, stats = self.preprocessor(channel_data)
+    #     gamma, beta = self.film_generator(stats)
+        
+    #     # 接收双流特征
+    #     raw_embeds, deep_feats = self.shape_encoder(x)
+        
+    #     # 1. Q-Former (语义)
+    #     query_tokens = self.qformer(deep_feats, instruction_embeds)
+        
+    #     # 2. Detail Projector (细节)
+    #     detail_tokens = self.detail_proj(raw_embeds) 
+        
+    #     # 3. 融合 (传入 sep_embed)
+    #     ts_tokens = self.adapter(
+    #         query_tokens, detail_tokens, 
+    #         sep_embed=sep_embed, 
+    #         gamma=gamma, beta=beta
+    #     )
+    #     ts_tokens = self.llm_proj(ts_tokens)
+        
+    #     return ts_tokens
 
     def forward(
         self,
@@ -601,6 +677,10 @@ class StatBypassCROMETS1(nn.Module):
         input_texts: Sequence[str],
         timeseries_lists: Sequence[Sequence[Tensor]],
         output_texts: Optional[Sequence[str]] = None,
+        # 新增 Mask 参数用于 Ablation
+        mask_query: bool = False,
+        mask_detail: bool = False,
+        mask_text_stats: bool = False
     ) -> Dict[str, Any]:
         """
         核心逻辑封装：统一构建训练和推理用的 Multimodal Embeddings。
@@ -618,8 +698,7 @@ class StatBypassCROMETS1(nn.Module):
         
         for i in range(batch_size):
             input_text = input_texts[i]
-            timeseries_list = list(timeseries_lists[i]) # 浅拷贝，防止修改原列表
-            # 处理 output_text (推理时可能为 None)
+            timeseries_list = list(timeseries_lists[i]) 
             output_text = output_texts[i] if output_texts is not None else None
             
             ts_marker = "<ts><ts/>"
@@ -628,13 +707,11 @@ class StatBypassCROMETS1(nn.Module):
             # 1. 提取全局指令 (Text-Guided)
             full_instruction_text = " ".join([p.strip() for p in text_parts if p.strip()])
             current_instruction_embeds = None
-            # 训练时的 Drop Text 策略
             drop_text = self.training and (torch.rand(1).item() < 0.15)
             
             if full_instruction_text and not drop_text:
                 instr_encoded = self.tokenizer([full_instruction_text], device)
                 input_ids = instr_encoded["input_ids"]
-                # 截断过长指令
                 if input_ids.shape[1] > 512:
                      input_ids = input_ids[:, :512]
                 current_instruction_embeds = self.llm.embed(input_ids)
@@ -642,7 +719,6 @@ class StatBypassCROMETS1(nn.Module):
             num_markers = len(text_parts) - 1
             num_timeseries = len(timeseries_list)
             
-            # 填充或截断 TS
             if num_timeseries < num_markers:
                 for _ in range(num_markers - num_timeseries):
                     timeseries_list.append(
@@ -671,7 +747,6 @@ class StatBypassCROMETS1(nn.Module):
             for ts_idx, ts_tensor in enumerate(timeseries_list):
                 ts_tensor = ts_tensor.to(device)
                 
-                # 计算统计量
                 if ts_tensor.numel() > 0:
                     ts_mean = ts_tensor.mean().item()
                     ts_std = ts_tensor.std().item()
@@ -679,8 +754,10 @@ class StatBypassCROMETS1(nn.Module):
                     ts_mean = 0.0
                     ts_std = 1.0
                 
-                # Stats Dropout (Training Only)
-                if self.training and torch.rand(1).item() < 0.5:
+                # Stats Dropout / Mask Logic
+                if mask_text_stats:
+                    stats_str = ""
+                elif self.training and torch.rand(1).item() < 0.5:
                     stats_str = ""
                 else:
                     stats_str = f" [Scale: {ts_std:.2f}, Offset: {ts_mean:.2f}] "
@@ -693,12 +770,24 @@ class StatBypassCROMETS1(nn.Module):
                     sep_embed=self.feat_sep_token
                 )
                 
+                # [新增] Ablation Masking Logic
+                if mask_query or mask_detail:
+                    num_q = self.config.query_tokens
+                    # ts_tokens 结构: [Batch=1, Num_Tokens, Dim]
+                    # 结构顺序: [Query(0:num_q), Sep(num_q), Detail(num_q+1:)]
+                    
+                    if mask_query:
+                        ts_tokens[:, :num_q, :] = 0.0
+                    
+                    if mask_detail:
+                        # 如果有 sep_token，则 Detail 从 num_q + 1 开始
+                        # 当前实现中 self.feat_sep_token 始终初始化，故有 Sep
+                        start_idx = num_q + 1
+                        ts_tokens[:, start_idx:, :] = 0.0
+
                 if ts_tokens.dtype != target_dtype:
                     ts_tokens = ts_tokens.to(dtype=target_dtype)
                 ts_embed = ts_tokens[0]
-                
-                # === [关键修改] 构建三明治结构: 方案 B ===
-                # Order: [Start] -> [Stats] -> [TS Features] -> [End]
                 
                 # (A) Start Token
                 segment_embeds.append(self.ts_start_token[0]) 
@@ -777,6 +866,7 @@ class StatBypassCROMETS1(nn.Module):
             "prefix_mask_lengths": prefix_mask_lengths,
             "suffix_mask_lengths": suffix_mask_lengths
         }
+
     def forward_chatts(
         self,
         input_texts: Sequence[str],
@@ -787,43 +877,46 @@ class StatBypassCROMETS1(nn.Module):
         """训练时调用，计算 Loss"""
         llm_kwargs = llm_kwargs or {}
         
-        # 调用统一构建函数
         prepared = self.prepare_multimodal_embeds(input_texts, timeseries_lists, output_texts)
         
-        # LLM Forward
         outputs = self.llm(
             inputs_embeds=prepared["inputs_embeds"],
             attention_mask=prepared["attention_mask"],
             **llm_kwargs,
         )
         
-        # 合并返回结果
         return {
             "llm_outputs": outputs,
             **prepared
         }
+
     @torch.no_grad()
     def generate(
         self,
         input_texts: Union[str, Sequence[str]],
         timeseries_lists: Union[Sequence[Tensor], Sequence[Sequence[Tensor]]],
+        mask_query: bool = False,
+        mask_detail: bool = False,
+        mask_text_stats: bool = False,
         **gen_kwargs
     ):
         """
-        推理时调用，替代 test_exam.py 中的手动构建逻辑。
-        支持单样本或 Batch 列表输入。
+        推理时调用，支持 Ablation Masking。
         """
-        # 统一格式化为 List
         if isinstance(input_texts, str):
             input_texts = [input_texts]
-        # 检查 timeseries_lists 是否是单样本的 list of tensors
         if len(timeseries_lists) > 0 and isinstance(timeseries_lists[0], Tensor):
             timeseries_lists = [timeseries_lists]
             
-        # 调用统一构建函数 (output_texts=None)
-        prepared = self.prepare_multimodal_embeds(input_texts, timeseries_lists, output_texts=None)
+        prepared = self.prepare_multimodal_embeds(
+            input_texts, 
+            timeseries_lists, 
+            output_texts=None,
+            mask_query=mask_query,
+            mask_detail=mask_detail,
+            mask_text_stats=mask_text_stats
+        )
         
-        # LLM Generate
         return self.llm.model.generate(
             inputs_embeds=prepared["inputs_embeds"],
             attention_mask=prepared["attention_mask"],
