@@ -12,7 +12,7 @@ fi
 
 # 训练参数配置
 LAST_MODEL="16"
-MODEL_SUFFIX="8b_tattn_16_skip_new"
+MODEL_SUFFIX="8b_tattn_16_skip_1207_stride8"
 
 # 数据路径定义
 PRETRAINED_PATH="model/encoder_$LAST_MODEL.pth"
@@ -37,7 +37,7 @@ EPOCHS=3
 LR=1e-3
 SEQ_LEN=1024
 PATCH_LEN=16
-PATCH_STRIDE=16
+PATCH_STRIDE=8
 WEIGHT_DECAY=0.01
 
 echo "=========================================="

@@ -491,8 +491,8 @@ def main():
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--patch-len", type=int, default=16)
     parser.add_argument("--patch-stride", type=int, default=8)
-    parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-3.2-3B")
-    parser.add_argument("--num-gen-samples", type=int, default=100)
+    parser.add_argument("--llm-model-path", type=str, default="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B")
+    parser.add_argument("--num-gen-samples", type=int, default=746)
     
     parser.add_argument("--use-lora", action="store_true")
     parser.add_argument("--lora-r", type=int, default=16)
@@ -534,7 +534,19 @@ def main():
         model.llm.model = get_peft_model(model.llm.model, peft_config)
         
     if rank == 0: print(f">>> Loading Checkpoint: {args.checkpoint}")
-    model.load_state_dict(torch.load(args.checkpoint, map_location=device), strict=False)
+    
+    state_dict = torch.load(args.checkpoint, map_location=device)
+    # 捕获返回值 msg
+    msg = model.load_state_dict(state_dict, strict=False)
+    
+    if rank == 0:
+        print(f">>> Weights Loaded.")
+        print(f"    - Missing Keys: {len(msg.missing_keys)}")
+        print(f"    - Unexpected Keys: {len(msg.unexpected_keys)}")
+        
+        # 如果想看具体漏了什么（可选）
+        if len(msg.missing_keys) > 0:
+            print(f"    ! Warning: First 5 missing keys: {msg.missing_keys[:5]}")
     
     ds = ExamChatTSDataset(
         args.jsonl_path, 

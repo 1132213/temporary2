@@ -189,6 +189,7 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
         llm_dtype="bfloat16",
         freeze_patch_encoder=True,
         epsilon=1e-5,
+        proj_dropout=args.proj_dropout
     )
     
     if rank == 0 and logger:
@@ -470,6 +471,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--model-suffix", type=str, default="")
+    parser.add_argument("--proj-dropout", type=float, default=0.05, 
+                        help="Dropout rate for MLP projectors during alignment.")
     
     args = parser.parse_args()
     

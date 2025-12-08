@@ -27,8 +27,9 @@ class CROMEConfig:
     adapter_hidden_dim: int = 256
     fuse_mode: str = "add"
     epsilon: float = 1e-4
+    proj_dropout: float = 0.0
     # LLM 接口
-    llm_model_path: str = "/root/emhua/btwu/Llama-2-7b-hf"
+    llm_model_path: str = "/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
     llm_dtype: str = "bfloat16"
     llm_device_map: str = "auto"
 
@@ -212,8 +213,8 @@ class QFormer(nn.Module):
         )
         
         # 2. 文本交互层 (Text Interaction)
+        self.layernorm_text_input = nn.LayerNorm(config.llm_embed_dim) # 注意维度是 llm_embed_dim
         self.text_proj = nn.Linear(config.llm_embed_dim, config.patch_embedding_dim)
-        self.ln_text_input = nn.LayerNorm(config.patch_embedding_dim)
         # Cross-Attention: Query 关注 Text
         self.text_attn = nn.MultiheadAttention(
             embed_dim=config.patch_embedding_dim,
@@ -262,7 +263,7 @@ class QFormer(nn.Module):
 
             # (B) 投影文本特征
             text_kv = self.text_proj(instruction_embeds) # [B, Text_Len, D]
-            text_kv = self.ln_text_input(text_kv)
+            # text_kv = self.ln_text_input(text_kv)
             
             # (C) Cross-Attention: Q=Queries, K=Text, V=Text
             text_out, attn_weights = self.text_attn(
@@ -305,16 +306,17 @@ class DetailProjection(nn.Module):
         # 输入和输出维度都是 patch_embedding_dim
         dim = config.patch_embedding_dim
         hidden_dim = dim * 4  # 中间层扩维以增加表达能力
-        
+        drop_rate = config.proj_dropout
         # 3层 MLP 结构
         self.proj = nn.Sequential(
             # 第一层：升维 + 激活
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
+            nn.Dropout(drop_rate),
             
-            # 第二层：特征变换 + 激活 (深度的来源)
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            # # 第二层：特征变换 + 激活 (深度的来源)
+            # nn.Linear(hidden_dim, hidden_dim),
+            # nn.GELU(),
             
             # 第三层：降维回目标空间
             nn.Linear(hidden_dim, dim)
@@ -494,6 +496,7 @@ class CROMETSModel(nn.Module):
         self.llm_proj = nn.Sequential(
             nn.Linear(config.patch_embedding_dim, config.llm_embed_dim),
             nn.GELU(),
+            nn.Dropout(config.proj_dropout),
             nn.Linear(config.llm_embed_dim, config.llm_embed_dim)
         )
 

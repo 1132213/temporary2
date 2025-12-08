@@ -72,7 +72,8 @@ def visualize_text_attention(
     # 过滤空串并拼接
     valid_parts = [p.strip() for p in text_parts if p.strip()]
     full_instruction_text = " ".join(valid_parts)
-    
+    while "\n\n" in full_instruction_text:
+        full_instruction_text = full_instruction_text.replace("\n\n", "\n")
     # [修改点] 打印完整拼接文本
     print("\n" + "="*60)
     print(f">>> ACTUAL MODEL INPUT TEXT (Spliced)")
@@ -207,8 +208,8 @@ def visualize_text_attention(
 if __name__ == "__main__":
     # 配置你的路径
     # JSONL_PATH = "/mnt/shared-storage-user/huaermo/code/test_wbt2/alignment.jsonl"
-    JSONL_PATH="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.json"
-    CHECKPOINT = "/mnt/shared-storage-user/huaermo/code/test_wbt2/temporary2/model/aligned_8b_tattn_16_skip_new.pth" # 确保这是你 Text-Guided 训练后的模型
+    JSONL_PATH="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.jsonl"
+    CHECKPOINT = "/mnt/shared-storage-user/huaermo/code/test_wbt2/temporary2/model/aligned_8b_tattn_16_skip_1207_stride8.pth" # 确保这是你 Text-Guided 训练后的模型
     # LLM_PATH = "/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-3B-Instruct"
     LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
 

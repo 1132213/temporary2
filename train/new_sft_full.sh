@@ -10,8 +10,8 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="8b_tattn_16_skip_new"
-MODEL_SUFFIX="8b_tattn_16_skip_new_full"
+LAST_MODEL="8b_tattn_16_skip_1207"
+MODEL_SUFFIX="8b_tattn_16_skip_1207_full"
 
 STAGE2_CHECKPOINT="model/aligned_$LAST_MODEL.pth"
 LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
@@ -33,14 +33,16 @@ MIX_PROBS="0.6,0.1,0.3"
 EVAL_DATA="$SFT_DATA"
 
 # 训练超参数
-BATCH_SIZE=2
-GRADIENT_ACCUM=8
+BATCH_SIZE=1
+GRADIENT_ACCUM=16
 EPOCHS=2
 LR=1e-5
 SEQ_LEN=1024
+
 PATCH_LEN=16
 PATCH_STRIDE=16
 WEIGHT_DECAY=0.05
+INTERVAL=0.25
 
 echo "=========================================="
 echo "ChatTS 指令微调 (Mix: SFT+IFT+Align, Val: SFT 10%)"
@@ -64,11 +66,10 @@ CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --epochs $EPOCHS \
     --num-workers 16 \
     --save-only-trainable \
-    --weight_decay $WEIGHT_DECAY \
-    --seed 42 \
-    --use-lora \
-    --lora-r 64 \
-    --lora-alpha 128 "
+    --weight-decay $WEIGHT_DECAY \
+    --seed 42  \
+    --eval-interval $INTERVAL
+    "
 
 if [ -n "$MODEL_SUFFIX" ]; then
     CMD="$CMD --model-suffix \"$MODEL_SUFFIX\""

@@ -201,6 +201,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         llm_dtype="bfloat16",
         freeze_patch_encoder=args.freeze_encoder,
         epsilon=1e-3, # 推荐: 1e-3 防止梯度爆炸
+        proj_dropout=args.proj_dropout
     )
     
     if rank == 0 and logger:
@@ -482,8 +483,17 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
     accumulation_steps = args.gradient_accumulation_steps
     current_grad_norm = 0.0
     
-    eval_steps_interval = int(len(train_loader) * args.eval_interval)
-    if eval_steps_interval <= 0: eval_steps_interval = len(train_loader)
+    # eval_steps_interval = int(len(train_loader) * args.eval_interval)
+    # if eval_steps_interval <= 0: eval_steps_interval = len(train_loader)
+    num_updates_per_epoch = len(train_loader) // accumulation_steps
+    
+    # 2. 计算每多少次更新评测一次
+    eval_updates_interval = int(num_updates_per_epoch * args.eval_interval)
+    if eval_updates_interval < 1: 
+        eval_updates_interval = 1
+        
+    # 3. 换算回 Dataloader 的 Step 数
+    eval_steps_interval = eval_updates_interval * accumulation_steps
 
     for epoch in range(args.epochs):
         if train_sampler is not None:
@@ -595,6 +605,8 @@ def main():
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.1)
     parser.add_argument("--save-only-trainable", action="store_true")
+    parser.add_argument("--proj-dropout", type=float, default=0.05, 
+                        help="Dropout rate for MLP projectors (DetailProj & LLMProj).")
     
     args = parser.parse_args()
     

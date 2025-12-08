@@ -10,8 +10,8 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="8b_tattn_16_skip_new"
-MODEL_SUFFIX="8b_tattn_16_skip_new"
+LAST_MODEL="8b_tattn_16_skip_1207_stride8"
+MODEL_SUFFIX="8b_tattn_16_skip_1207_stride8"
 
 STAGE2_CHECKPOINT="model/aligned_$LAST_MODEL.pth"
 LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
@@ -22,7 +22,7 @@ IFT_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/ChatTS/ift/train.jsonl
 ALIGN_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/ChatTS/align_random/train.jsonl"
 
 # 自动评测脚本用的测试集 (如果需要)
-TEST_EXAM_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.jsonl" 
+TEST_EXAM_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.jsonl"
 
 # 混合配置
 MIX_PATHS="$SFT_DATA,$IFT_DATA,$ALIGN_DATA"
@@ -32,16 +32,17 @@ MIX_PROBS="0.6,0.1,0.3"
 EVAL_DATA="$SFT_DATA"
 
 # 训练超参数
-BATCH_SIZE=2
-GRADIENT_ACCUM=8
+BATCH_SIZE=1
+GRADIENT_ACCUM=16
 EPOCHS=2
 LR=1e-4
 SEQ_LEN=1024
 PATCH_LEN=16
-PATCH_STRIDE=16
+PATCH_STRIDE=8
+INTERVAL=0.25
 
 echo "=========================================="
-echo "ChatTS 指令微调 (Mix: SFT+IFT+Align, Val: SFT 10%)"
+echo " ChatTS sft "
 echo "=========================================="
 
 CMD="torchrun --nproc_per_node=$NUM_GPUS \
@@ -65,7 +66,9 @@ CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --seed 42 \
     --use-lora \
     --lora-r 64 \
-    --lora-alpha 128 "
+    --lora-alpha 128 \
+    --eval-interval $INTERVAL "
+    
 
 if [ -n "$MODEL_SUFFIX" ]; then
     CMD="$CMD --model-suffix \"$MODEL_SUFFIX\""
