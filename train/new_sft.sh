@@ -10,8 +10,8 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="8b_tattn_16_skip_1207_stride8"
-MODEL_SUFFIX="8b_tattn_16_skip_1207_stride8"
+LAST_MODEL="8b_tattn_16_1208_stride8_residual"
+MODEL_SUFFIX="8b_tattn_16_1208_stride8_residual"
 
 STAGE2_CHECKPOINT="model/aligned_$LAST_MODEL.pth"
 LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"

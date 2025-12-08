@@ -209,7 +209,7 @@ if __name__ == "__main__":
     # 配置你的路径
     # JSONL_PATH = "/mnt/shared-storage-user/huaermo/code/test_wbt2/alignment.jsonl"
     JSONL_PATH="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.jsonl"
-    CHECKPOINT = "/mnt/shared-storage-user/huaermo/code/test_wbt2/temporary2/model/aligned_8b_tattn_16_skip_1207_stride8.pth" # 确保这是你 Text-Guided 训练后的模型
+    CHECKPOINT = "/mnt/shared-storage-user/huaermo/code/test_wbt2/temporary2/model/aligned_8b_tattn_16_1208_stride8_residual.pth" # 确保这是你 Text-Guided 训练后的模型
     # LLM_PATH = "/mnt/shared-storage-user/dllm-share/Models/Qwen2.5-3B-Instruct"
     LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
 

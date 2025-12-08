@@ -97,7 +97,7 @@ def generate_predictions(
                 
                 # --- Prompt 构造 ---
                 if enable_cot:
-                    cot_suffix = "\nLet's analyze step by step. At the end, state the answer as 'The answer is <Option>'."
+                    cot_suffix = "\nPlease answer the question and provide the correct option letter, e.g., A), B), C), D), and option content at the end of your answer. All information need to answer the question is given. If you are unsure, please provide your best guess."
                     full_input = f"<|im_start|>user\n{original_input}{cot_suffix}<|im_end|>\n<|im_start|>assistant\n"
                     max_new_tokens = 512 
                     stop_prefix = None
