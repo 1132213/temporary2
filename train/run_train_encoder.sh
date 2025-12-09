@@ -7,10 +7,10 @@
 # ==================== 配置参数 ====================
 
 # 数据文件路径
-JSONL_PATH="/datadisk/hem/dataset/merge.jsonl"
+JSONL_PATH="/mnt/shared-storage-user/huaermo/code/test_wbt2/gifteval_windows1.jsonl"
 
 # LLM 模型路径（用于获取 embed_dim）
-LLM_MODEL_PATH="/mnt/public/hf_models/Qwen/Qwen2.5-3B-Instruct"
+LLM_MODEL_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
 
 # 序列长度
 SEQ_LEN=1024
@@ -21,11 +21,11 @@ EPOCHS=20
 LR=1e-3
 
 # 模型架构参数
-PATCH_LEN=8
-PATCH_STRIDE=8
+# PATCH_LEN=8
+# PATCH_STRIDE=8
 
-# PATCH_LEN=16
-# PATCH_STRIDE=16
+PATCH_LEN=16
+PATCH_STRIDE=16
 
 # PATCH_STRIDE=8
 INPUT_CHANNELS=1
@@ -35,7 +35,7 @@ DEVICE="cuda"
 GPU_ID=1
 
 # 模型名称后缀（可选）
-MODEL_SUFFIX="p8"  # 可选：模型名称后缀，例如设置为 "1st" 则保存为 patchtst_pretrained_full_1st.pth
+MODEL_SUFFIX="new16"  # 可选：模型名称后缀，例如设置为 "1st" 则保存为 patchtst_pretrained_full_1st.pth
 
 # ==================== 检查配置 ====================
 

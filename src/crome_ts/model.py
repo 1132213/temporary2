@@ -9,7 +9,109 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
+# === RoPE (Rotary Positional Embedding) 实现 ===
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=4096, base=10000, device=None):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.max_position_embeddings = max_position_embeddings
+        # 预计算频率
+        self._set_cos_sin_cache(seq_len=max_position_embeddings, device=device)
+
+    def _set_cos_sin_cache(self, seq_len, device):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim))
+        freqs = torch.outer(t, inv_freq)
+        # Different from some implementations, we concat in last dim to match (d/2) pair
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, x, seq_len):
+        # x: [Batch, Heads, Seq_Len, Head_Dim]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len + 128, device=x.device)
+            
+        return (
+            self.cos_cached[..., :seq_len, :].to(dtype=x.dtype),
+            self.sin_cached[..., :seq_len, :].to(dtype=x.dtype),
+        )
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    # q, k: [Batch, Heads, Seq_Len, Head_Dim]
+    # cos, sin: [1, 1, Seq_Len, Head_Dim]
+    # 确保 cos/sin 与 q/k 广播兼容
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+# === 支持 RoPE 的自定义 Transformer Block ===
+
+class RoPESelfAttention(nn.Module):
+    def __init__(self, dim, num_heads, dropout=0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, rotary_emb):
+        B, L, D = x.shape
+        # [B, L, 3*D] -> [B, L, 3, Heads, Head_Dim] -> [3, B, Heads, L, Head_Dim]
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Apply RoPE
+        # rotary_emb 是一个 Callable，返回 (cos, sin)
+        cos, sin = rotary_emb(v, seq_len=L)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Attention: [B, Heads, L, L]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+
+        # Output: [B, L, D]
+        x = (attn @ v).transpose(1, 2).reshape(B, L, D)
+        x = self.proj(x)
+        x = self.dropout(x)
+        return x
+
+class RoPETransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = RoPESelfAttention(dim, num_heads, dropout=dropout)
+        
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(dim * mlp_ratio), dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x, rotary_emb):
+        # Pre-Norm 结构，更稳定
+        x = x + self.attn(self.norm1(x), rotary_emb)
+        x = x + self.mlp(self.norm2(x))
+        return x
+        
 @dataclass
 class CROMEConfig:
     """
@@ -143,22 +245,82 @@ class PatchEmbedding(nn.Module):
         return self.project(patches)
 
 
+# class PatchTSTEncoder(nn.Module):
+#     """模块 II：冻结 PatchTST 形态编码器。"""
+#     def __init__(self, config: CROMEConfig, input_dim: int):
+#         super().__init__()
+#         self.config = config 
+#         self.embedding = PatchEmbedding(config, input_dim)
+#         self.pos_encoding = FixedSinePositionalEncoding(
+#             dim=config.patch_embedding_dim, 
+#             scale=10000.0
+#         )
+#         layer = nn.TransformerEncoderLayer(
+#             d_model=config.patch_embedding_dim,
+#             nhead=config.patch_num_heads,
+#             batch_first=True,
+#         )
+#         self.encoder = nn.TransformerEncoder(layer, num_layers=config.patch_num_layers)
+#         if config.freeze_patch_encoder:
+#             self._freeze()
+
+#     def _freeze(self) -> None:
+#         for p in self.parameters():
+#             p.requires_grad_(False)
+
+#     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+#         # x: [Batch, Seq_Len, Channels]
+        
+#         # 1. Patchify & Project
+#         # emb: [Batch, Num_Patches, Patch_Dim]
+#         emb = self.embedding(x) 
+        
+#         # 2. [核心修改] 动态生成 Patch 级位置编码
+#         # 获取当前的 patch 数量
+#         b, num_patches, d = emb.shape
+        
+#         # 生成对应的 PE: [Num_Patches, Patch_Dim]
+#         # 注意：这里传入的是 num_patches，代表“第几个Patch”，而不是“第几秒”
+#         pe = self.pos_encoding(num_patches, device=x.device, dtype=emb.dtype)
+        
+#         # 广播并相加: [1, N, D] + [B, N, D]
+#         emb = emb + pe.unsqueeze(0)
+
+#         if self.config.freeze_patch_encoder:
+#             with torch.no_grad():
+#                 enc_out = self.encoder(emb)
+#                 return emb, enc_out 
+#         else:
+#             enc_out = self.encoder(emb)
+#             return emb, enc_out 
 class PatchTSTEncoder(nn.Module):
-    """模块 II：冻结 PatchTST 形态编码器。"""
+    """模块 II：基于 RoPE 的 PatchTST 编码器。"""
     def __init__(self, config: CROMEConfig, input_dim: int):
         super().__init__()
-        self.config = config 
+        self.config = config
+        
+        # 1. Patch Embedding (保持不变)
         self.embedding = PatchEmbedding(config, input_dim)
-        self.pos_encoding = FixedSinePositionalEncoding(
-            dim=config.patch_embedding_dim, 
-            scale=10000.0
-        )
-        layer = nn.TransformerEncoderLayer(
-            d_model=config.patch_embedding_dim,
-            nhead=config.patch_num_heads,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=config.patch_num_layers)
+        
+        # 2. RoPE 生成器 (替代原有的 FixedSinePositionalEncoding)
+        # head_dim = embedding_dim / num_heads
+        head_dim = config.patch_embedding_dim // config.patch_num_heads
+        self.rotary_emb = RotaryEmbedding(dim=head_dim)
+
+        # 3. Transformer Blocks (替代原有的 nn.TransformerEncoder)
+        self.blocks = nn.ModuleList([
+            RoPETransformerBlock(
+                dim=config.patch_embedding_dim,
+                num_heads=config.patch_num_heads,
+                mlp_ratio=4.0,
+                dropout=0.1 # 如果 config 有 dropout 参数可替换
+            )
+            for _ in range(config.patch_num_layers)
+        ])
+        
+        # 4. Final Norm (Pre-Norm 结构通常需要在最后加一层 Norm)
+        self.norm = nn.LayerNorm(config.patch_embedding_dim)
+
         if config.freeze_patch_encoder:
             self._freeze()
 
@@ -169,29 +331,23 @@ class PatchTSTEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         # x: [Batch, Seq_Len, Channels]
         
-        # 1. Patchify & Project
-        # emb: [Batch, Num_Patches, Patch_Dim]
+        # 1. Patchify & Project -> [Batch, Num_Patches, Patch_Dim]
         emb = self.embedding(x) 
         
-        # 2. [核心修改] 动态生成 Patch 级位置编码
-        # 获取当前的 patch 数量
-        b, num_patches, d = emb.shape
+        # 2. Forward through Blocks with RoPE
+        # 注意：不再需要 self.pos_encoding(emb) 的加法操作
         
-        # 生成对应的 PE: [Num_Patches, Patch_Dim]
-        # 注意：这里传入的是 num_patches，代表“第几个Patch”，而不是“第几秒”
-        pe = self.pos_encoding(num_patches, device=x.device, dtype=emb.dtype)
+        x_out = emb
+        for block in self.blocks:
+            x_out = block(x_out, self.rotary_emb)
         
-        # 广播并相加: [1, N, D] + [B, N, D]
-        emb = emb + pe.unsqueeze(0)
+        x_out = self.norm(x_out)
 
         if self.config.freeze_patch_encoder:
-            with torch.no_grad():
-                enc_out = self.encoder(emb)
-                return emb, enc_out 
+            # 返回原始 emb 和编码后的特征
+            return emb, x_out.detach()
         else:
-            enc_out = self.encoder(emb)
-            return emb, enc_out 
-
+            return emb, x_out
 
 class QFormer(nn.Module):
     """
@@ -295,34 +451,23 @@ class QFormer(nn.Module):
 
 
 class DetailProjection(nn.Module):
-    """
-    模块 III 分支 B：局部细节投影 (3-Layer MLP)。
-    用于将原始的 Shallow Patch 特征映射到 LLM 语义空间。
-    结构：Dim -> 4*Dim -> 4*Dim -> Dim
-    """
-    def __init__(self, config: CROMEConfig):
+    def __init__(self, config: CROMEConfig, input_dim: int = None):
         super().__init__()
         
-        # 输入和输出维度都是 patch_embedding_dim
-        dim = config.patch_embedding_dim
-        hidden_dim = dim * 4  # 中间层扩维以增加表达能力
+        dim = input_dim if input_dim is not None else config.patch_embedding_dim
+        target_dim = config.patch_embedding_dim 
+        
+        hidden_dim = target_dim * 4  
         drop_rate = config.proj_dropout
-        # 3层 MLP 结构
+
         self.proj = nn.Sequential(
-            # 第一层：升维 + 激活
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(drop_rate),
             
-            # # 第二层：特征变换 + 激活 (深度的来源)
-            # nn.Linear(hidden_dim, hidden_dim),
-            # nn.GELU(),
-            
-            # 第三层：降维回目标空间
-            nn.Linear(hidden_dim, dim)
+            nn.Linear(hidden_dim, target_dim)
         )
         
-        # 初始化策略 (可选，保持默认通常也可以，但 Xavier/Kaiming 有助于深层网络)
         self._init_weights()
 
     def _init_weights(self):
@@ -523,16 +668,36 @@ class CROMETSModel(nn.Module):
         self.resid_patch_len = 8  # 使用更小的 Patch
         self.resid_stride = 4     # 配合 Stride=4 或 2
         
-        # 独立的线性层，随机初始化
+
+        # (A) 残差特征的 Embedding (不包含位置信息)
         self.resid_embedding = nn.Linear(
             self.resid_patch_len * config.input_channels, 
             config.patch_embedding_dim
         )
         nn.init.xavier_uniform_(self.resid_embedding.weight)
+        
+        # (B) 定义独立的 PE 维度 (例如 64 维)
+        self.pe_dim = 64 
         self.resid_pos_encoding = FixedSinePositionalEncoding(
-            dim=config.patch_embedding_dim, 
+            dim=self.pe_dim, 
             scale=10000.0
         )
+        
+        # (C) 初始化 DetailProjector
+        # 输入维度 = 特征维度 (512) + 位置维度 (64)
+        concat_dim = config.patch_embedding_dim + self.pe_dim
+        self.detail_proj = DetailProjection(config, input_dim=concat_dim)
+        
+        # 独立的线性层，随机初始化
+        # self.resid_embedding = nn.Linear(
+        #     self.resid_patch_len * config.input_channels, 
+        #     config.patch_embedding_dim
+        # )
+        # nn.init.xavier_uniform_(self.resid_embedding.weight)
+        # self.resid_pos_encoding = FixedSinePositionalEncoding(
+        #     dim=config.patch_embedding_dim, 
+        #     scale=10000.0
+        # )
         
         # self.llm_proj = nn.Linear(config.patch_embedding_dim, config.llm_embed_dim)
         self.llm_proj = nn.Sequential(
@@ -565,11 +730,23 @@ class CROMETSModel(nn.Module):
         
         # 使用独立 Embedding 层
         resid_embeds = self.resid_embedding(resid_patches) # [B, N_resid, 512]
+
+        # (B) 生成位置编码 [N, 64]
         pe = self.resid_pos_encoding(n, device=resid_embeds.device, dtype=resid_embeds.dtype)
-        resid_embeds = resid_embeds + pe.unsqueeze(0) # Broadcasting add
+        # (C) 扩展到 Batch [1, N, 64] -> [B, N, 64]
+        pe = pe.unsqueeze(0).expand(b, -1, -1)
         
-        # 送入 Detail Projector
-        detail_tokens = self.detail_proj(resid_embeds)
+        # (D) 拼接: [B, N, 512+64]
+        resid_cat = torch.cat([resid_embeds, pe], dim=-1)
+        
+        # (E) 送入 Projector (576 -> 512)
+        detail_tokens = self.detail_proj(resid_cat)
+        
+        # pe = self.resid_pos_encoding(n, device=resid_embeds.device, dtype=resid_embeds.dtype)
+        # resid_embeds = resid_embeds + pe.unsqueeze(0) # Broadcasting add
+        
+        # # 送入 Detail Projector
+        # detail_tokens = self.detail_proj(resid_embeds)
         
         # 4. 融合
         # 注意: 此时 detail_tokens 的长度 (N_resid) 是 query_tokens (32) 或原 patch (N_main) 的 4 倍

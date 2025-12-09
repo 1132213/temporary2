@@ -15,23 +15,7 @@ if str(project_root) not in sys.path:
 from src.crome_ts.model import CROMEConfig, PatchTSTEncoder, RevIN, get_llm_embed_dim
 from src.crome_ts.data_instruct import JSONLInstructDataset, instruct_collate_fn
 
-# --- 2. 模型定义 (同步 FixedPositionalEncoding 版本) ---
-
-class FixedPositionalEncoding(nn.Module):
-    """标准的正弦位置编码 (不可学习)"""
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        
-        self.register_buffer('pe', pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1), :]
+# --- 2. 模型定义 (适配 RoPE 版本) ---
 
 class PatchTSTForMaskedPretraining(nn.Module):
     def __init__(self, config):
@@ -41,10 +25,10 @@ class PatchTSTForMaskedPretraining(nn.Module):
         # 1. 归一化
         self.revin = RevIN(config.epsilon)
         
-        # 2. 固定位置编码
-        self.pos_encoding = FixedPositionalEncoding(config.patch_embedding_dim, max_len=5000)
+        # 2. [修改] 移除外部位置编码 (改用 Encoder 内部的 RoPE)
+        # self.pos_encoding = FixedPositionalEncoding(...)
         
-        # 3. 编码器
+        # 3. 编码器 (现在内部包含 RoPE 和 Blocks)
         self.encoder = PatchTSTEncoder(config, config.input_channels)
         
         # 4. Mask Token
@@ -72,7 +56,7 @@ class PatchTSTForMaskedPretraining(nn.Module):
         ids_shuffle = torch.argsort(noise, dim=1)
         
         mask = torch.zeros(B, N, dtype=torch.bool, device=x.device)
-        # 如果 mask_ratio 为 0，这里 len_keep == N，不会进行 scatter，mask 全为 False
+        # 如果 mask_ratio 为 0，这里 len_keep == N，不会进行 scatter
         if len_keep < N:
             mask.scatter_(1, ids_shuffle[:, len_keep:], 1) # 1=Masked
         
@@ -82,11 +66,19 @@ class PatchTSTForMaskedPretraining(nn.Module):
             mask_expanded = mask.unsqueeze(-1).expand(-1, -1, D)
             x_input[mask_expanded] = self.mask_token.expand_as(x_input)[mask_expanded]
         
-        # 5. 注入位置信息 (Add PE)
-        x_final = self.pos_encoding(x_input)
+        # 5. [修改] 移除外部位置编码注入
+        # x_final = self.pos_encoding(x_input)
+        x_final = x_input
         
-        # 6. Encoder Forward
-        latent = self.encoder.encoder(x_final)
+        # 6. [修改] Encoder Forward (适配 RoPE)
+        # 原代码: latent = self.encoder.encoder(x_final)
+        # 新代码: 手动调用 Blocks 传入 RoPE
+        x_out = x_final
+        for block in self.encoder.blocks:
+            x_out = block(x_out, self.encoder.rotary_emb)
+        
+        # 别忘了最后的 Norm
+        latent = self.encoder.norm(x_out)
         
         # 7. 重建 Patch
         pred_patches = self.head(latent).view(B, N, self.config.patch_len, C)
@@ -95,8 +87,7 @@ class PatchTSTForMaskedPretraining(nn.Module):
         recon_series = torch.zeros_like(x_norm)
         count_map = torch.zeros_like(x_norm)
         
-        # --- 核心修改：准确计算盲区 ---
-        # visible_count 记录每个时间点被多少个“未Mask”的 Patch 覆盖
+        # 准确计算盲区
         visible_count = torch.zeros(B, L, device=x.device)
         
         stride = self.config.patch_stride
@@ -168,6 +159,7 @@ def main(args):
     print(f">>> Loading model from {args.checkpoint}...")
     model = PatchTSTForMaskedPretraining(config).to(device)
     
+    # 注意：这里的权重必须是重新训练过的 (RoPE版本)，否则 key 会不匹配
     checkpoint = torch.load(args.checkpoint, map_location=device)
     
     if "state_dict" in checkpoint:
@@ -176,12 +168,14 @@ def main(args):
             print(">>> Successfully loaded FULL model (Encoder + Head).")
         except Exception as e:
             print(f"!!! Error loading state_dict: {e}")
+            print("!!! Attempting strict=False load...")
             model.load_state_dict(checkpoint["state_dict"], strict=False)
     elif "encoder" in checkpoint:
         print("!!! Warning: Checkpoint contains 'encoder' only. Head might be random.")
-        model.encoder.load_state_dict(checkpoint["encoder"])
+        # 注意：这里的 encoder key 也变了，可能需要手动适配
+        model.encoder.load_state_dict(checkpoint["encoder"], strict=False)
     else:
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint, strict=False)
     
     model.eval()
     
@@ -227,12 +221,12 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--jsonl-path", type=str, default="/root/emhua/btwu/CROME2/data/gifteval_windows1.jsonl")
-    parser.add_argument("--checkpoint", type=str, default="patchtst_pretrained_full.pth")
-    parser.add_argument("--seq-len", type=int, default=256)
+    parser.add_argument("--checkpoint", type=str, default="model/encoder_p8.pth") # 确保指向新训练的权重
+    parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--input-channels", type=int, default=1)
-    parser.add_argument("--patch-len", type=int, default=16)
-    parser.add_argument("--patch-stride", type=int, default=8)
-    parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-3.2-3B")
+    parser.add_argument("--patch-len", type=int, default=32)
+    parser.add_argument("--patch-stride", type=int, default=16)
+    parser.add_argument("--llm-model-path", type=str, default="/root/emhua/btwu/Llama-2-7b-hf")
     parser.add_argument("--num-samples", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--gpu-id", type=str, default=None)

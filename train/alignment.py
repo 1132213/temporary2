@@ -220,8 +220,8 @@ def train_chatts_alignment_ddp(args, rank, world_size, local_rank):
                 new_k = k
                 if k.startswith('encoder.encoder.'):
                     new_k = k.replace('encoder.encoder.', 'encoder.')
-                elif k.startswith('encoder.embedding.'):
-                    new_k = k.replace('encoder.embedding.', 'embedding.')
+                elif k.startswith('encoder.'):
+                    new_k = k.replace('encoder.', '')
                 elif k in ['mask_token', 'head.weight', 'head.bias'] or k.startswith('pos_encoding.'):
                     continue
                 fixed_dict[new_k] = v
