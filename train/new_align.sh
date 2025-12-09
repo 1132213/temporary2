@@ -12,7 +12,7 @@ fi
 
 # 训练参数配置
 LAST_MODEL="16"
-MODEL_SUFFIX="8b_tattn_16_1208_stride8_residual"
+MODEL_SUFFIX="8b_tattn_16_1208_stride8_residual_data"
 
 # 数据路径定义
 PRETRAINED_PATH="model/encoder_$LAST_MODEL.pth"
@@ -20,11 +20,11 @@ LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
 
 # 数据集
 IFT_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/ChatTS/ift/train.jsonl"
-ALIGN_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/ChatTS/align_256/train.jsonl"
+ALIGN_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/ChatTS/align_random/train.jsonl"
 
 # 混合配置
 MIX_PATHS="$ALIGN_DATA,$IFT_DATA"
-MIX_PROBS="0.9,0.1"
+MIX_PROBS="0.8,0.2"
 
 # === 关键修改：指定验证集来源 ===
 # 这将导致代码只从 ALIGN_DATA 切分 10% 做验证，IFT_DATA 将 100% 用于训练
@@ -35,7 +35,7 @@ BATCH_SIZE=2
 GRAD_ACCUM=16
 EPOCHS=3
 LR=1e-3
-SEQ_LEN=1024
+SEQ_LEN=2048
 PATCH_LEN=16
 PATCH_STRIDE=8
 WEIGHT_DECAY=0.01

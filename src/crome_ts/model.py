@@ -520,7 +520,7 @@ class CROMETSModel(nn.Module):
         self.adapter = CROMEAdapter(config)
 
         self.decomp = SeriesDecomp(kernel_size=25)
-        self.resid_patch_len = 4  # 使用更小的 Patch
+        self.resid_patch_len = 8  # 使用更小的 Patch
         self.resid_stride = 4     # 配合 Stride=4 或 2
         
         # 独立的线性层，随机初始化
@@ -529,6 +529,10 @@ class CROMETSModel(nn.Module):
             config.patch_embedding_dim
         )
         nn.init.xavier_uniform_(self.resid_embedding.weight)
+        self.resid_pos_encoding = FixedSinePositionalEncoding(
+            dim=config.patch_embedding_dim, 
+            scale=10000.0
+        )
         
         # self.llm_proj = nn.Linear(config.patch_embedding_dim, config.llm_embed_dim)
         self.llm_proj = nn.Sequential(
@@ -561,6 +565,8 @@ class CROMETSModel(nn.Module):
         
         # 使用独立 Embedding 层
         resid_embeds = self.resid_embedding(resid_patches) # [B, N_resid, 512]
+        pe = self.resid_pos_encoding(n, device=resid_embeds.device, dtype=resid_embeds.dtype)
+        resid_embeds = resid_embeds + pe.unsqueeze(0) # Broadcasting add
         
         # 送入 Detail Projector
         detail_tokens = self.detail_proj(resid_embeds)
@@ -712,8 +718,8 @@ class StatBypassCROMETS1(nn.Module):
             if full_instruction_text and not drop_text:
                 instr_encoded = self.tokenizer([full_instruction_text], device)
                 input_ids = instr_encoded["input_ids"]
-                if input_ids.shape[1] > 512:
-                     input_ids = input_ids[:, :512]
+                if input_ids.shape[1] > 2048:
+                     input_ids = input_ids[:, :2048]
                 current_instruction_embeds = self.llm.embed(input_ids)
             
             num_markers = len(text_parts) - 1

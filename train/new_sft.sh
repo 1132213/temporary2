@@ -10,8 +10,8 @@ else
 fi
 
 # 训练参数配置
-LAST_MODEL="8b_tattn_16_1208_stride8_residual"
-MODEL_SUFFIX="8b_tattn_16_1208_stride8_residual"
+LAST_MODEL="8b_tattn_16_1208_stride8_residual_data"
+MODEL_SUFFIX="8b_tattn_16_1208_stride8_residual_data"
 
 STAGE2_CHECKPOINT="model/aligned_$LAST_MODEL.pth"
 LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
@@ -26,7 +26,7 @@ TEST_EXAM_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.jsonl"
 
 # 混合配置
 MIX_PATHS="$SFT_DATA,$IFT_DATA,$ALIGN_DATA"
-MIX_PROBS="0.6,0.1,0.3"
+MIX_PROBS="0.5,0.3,0.2"
 
 # 代码将从 SFT_DATA 切出 10% 做 Loss 验证，IFT 和 ALIGN 将 100% 参与训练
 EVAL_DATA="$SFT_DATA"
@@ -36,7 +36,7 @@ BATCH_SIZE=1
 GRADIENT_ACCUM=16
 EPOCHS=2
 LR=1e-4
-SEQ_LEN=1024
+SEQ_LEN=2048
 PATCH_LEN=16
 PATCH_STRIDE=8
 INTERVAL=0.25
