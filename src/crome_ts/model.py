@@ -349,106 +349,234 @@ class PatchTSTEncoder(nn.Module):
         else:
             return emb, x_out
 
+# class QFormer(nn.Module):
+#     """
+#     模块 III 分支 A：Text-Guided Q-Former (方案 B+ 增强版).
+#     包含：
+#     1. Cross-Attention 文本引导
+#     2. Attention 权重暴露 (用于可视化)
+#     3. 全面 Dropout (防止过拟合)
+#     """
+#     def __init__(self, config: CROMEConfig):
+#         super().__init__()
+#         self.config = config
+        
+#         dropout_rate = getattr(config, "dropout", 0.1)
+        
+#         # 1. 可学习的 Query Tokens (Base Queries)
+#         self.query_tokens = nn.Parameter(
+#             torch.randn(config.query_tokens, config.patch_embedding_dim)
+#         )
+        
+#         # 2. 文本交互层 (Text Interaction)
+#         self.layernorm_text_input = nn.LayerNorm(config.llm_embed_dim) # 注意维度是 llm_embed_dim
+#         self.text_proj = nn.Linear(config.llm_embed_dim, config.patch_embedding_dim)
+#         # Cross-Attention: Query 关注 Text
+#         self.text_attn = nn.MultiheadAttention(
+#             embed_dim=config.patch_embedding_dim,
+#             num_heads=config.patch_num_heads,
+#             dropout=dropout_rate, 
+#             batch_first=True
+#         )
+#         self.ln_text = nn.LayerNorm(config.patch_embedding_dim)
+
+#         # 3. 时序提取层 (Time-Series Extraction)
+#         # Cross-Attention: Query 关注 TS Patch
+#         self.ln_ts_input = nn.LayerNorm(config.patch_embedding_dim)
+#         self.ts_attn = nn.MultiheadAttention(
+#             embed_dim=config.patch_embedding_dim,
+#             num_heads=config.patch_num_heads,
+#             dropout=dropout_rate,
+#             batch_first=True
+#         )
+#         self.ln_ts = nn.LayerNorm(config.patch_embedding_dim)
+        
+#         self.dropout = nn.Dropout(dropout_rate)
+
+#         # nn.init.zeros_(self.text_proj.weight)
+#         # nn.init.zeros_(self.text_proj.bias)
+#         nn.init.xavier_uniform_(self.text_proj.weight)
+#         if self.text_proj.bias is not None:
+#             nn.init.zeros_(self.text_proj.bias)
+
+#         self.last_text_attn_weights = None
+
+#     def forward(self, patch_tokens: Tensor, instruction_embeds: Optional[Tensor] = None) -> Tensor:
+#         b = patch_tokens.size(0)
+        
+#         # 1. 扩展 Base Query
+#         queries = self.query_tokens.unsqueeze(0).expand(b, -1, -1) # [B, 32, D]
+        
+#         # 重置可视化权重 (防止 Text Dropout 时残留旧权重)
+#         self.last_text_attn_weights = None
+        
+#         # 2. [阶段一] 文本引导：Query 主动“读取”指令
+#         if instruction_embeds is not None:
+#             # instruction_embeds: [B, Text_Len, LLM_Dim]
+            
+#             # (A) 类型转换 (解决 BF16 vs FP32 冲突)
+#             instruction_embeds = instruction_embeds.to(dtype=self.text_proj.weight.dtype)
+
+#             # (B) 投影文本特征
+#             text_kv = self.text_proj(instruction_embeds) # [B, Text_Len, D]
+#             # text_kv = self.ln_text_input(text_kv)
+            
+#             # (C) Cross-Attention: Q=Queries, K=Text, V=Text
+#             text_out, attn_weights = self.text_attn(
+#                 query=queries,
+#                 key=text_kv,
+#                 value=text_kv
+#             )
+            
+#             # 保存权重供可视化 (Detach + CPU 以节省显存)
+#             # 形状通常为 [Batch, Queries, Text_Len] (若 average_attn_weights=True)
+#             self.last_text_attn_weights = attn_weights.detach().cpu()
+            
+#             # (D) 残差 + Norm + Dropout
+#             # 注意：这里采用了 Pre-Norm 或 Post-Norm 结构均可，这里维持原有的 Post-Norm 逻辑
+#             # Query = Norm(Query + Dropout(Attn(Q, Text)))
+#             queries = self.ln_text(queries + self.dropout(text_out))
+        
+#         # 3. [阶段二] 时序提取：带着意图的 Query 提取时序特征
+#         # Q=Queries(Text-Aware), K=TS_Patch, V=TS_Patch
+#         patch_tokens_norm = self.ln_ts_input(patch_tokens)
+#         ts_out, _ = self.ts_attn(
+#             query=queries, 
+#             key=patch_tokens_norm, 
+#             value=patch_tokens
+#         )
+        
+#         # 输出前应用 Dropout
+#         return self.ln_ts(self.dropout(ts_out))
+class QFormerLayer(nn.Module):
+    """
+    Q-Former 的单层 Block。
+    执行顺序：Self-Attn (Query) -> Cross-Attn (Text) -> Cross-Attn (Time Series) -> FFN
+    """
+    def __init__(self, config: CROMEConfig):
+        super().__init__()
+        dim = config.patch_embedding_dim
+        num_heads = config.patch_num_heads
+        dropout = getattr(config, "dropout", 0.1)
+        
+        # 1. Self-Attention: Query Tokens 内部交互
+        self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        
+        # 2. Text Cross-Attention: 文本引导 (Instruction)
+        self.text_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        # 文本投影层：将 LLM 维度的文本映射到 Q-Former 维度
+        self.text_proj = nn.Linear(config.llm_embed_dim, dim) 
+        
+        # 3. Time-Series Cross-Attention: 时序特征提取
+        self.ts_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm3 = nn.LayerNorm(dim)
+        
+        # 4. Feed Forward Network
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+        self.norm4 = nn.LayerNorm(dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+        # 保存最后一次的 Attention 权重用于可视化
+        self.last_text_attn_weights = None
+        self.last_ts_attn_weights = None
+
+    def forward(self, queries, text_embeds, ts_embeds):
+        """
+        queries: [Batch, Num_Queries, Dim]
+        text_embeds: [Batch, Text_Len, LLM_Dim]
+        ts_embeds: [Batch, Num_Patches, Dim]
+        """
+        # 1. Self-Attention (Q=K=V=Queries)
+        # Query 之间相互交流，整合上一层提取到的信息
+        q_out, _ = self.self_attn(queries, queries, queries)
+        queries = self.norm1(queries + self.dropout(q_out))
+        
+        # 2. Text Interaction (文本引导)
+        if text_embeds is not None:
+            # === [修复点] ===
+            # text_embeds 是 BFloat16 (来自 LLM), text_proj 是 Float32 (来自 QFormer)
+            # 必须先将输入转为与权重一致的类型 (Float32)
+            text_embeds_input = text_embeds.to(self.text_proj.weight.dtype)
+            
+            # 投影文本特征到当前维度
+            text_kv = self.text_proj(text_embeds_input).to(queries.dtype)
+            
+            # Cross-Attention: Query 关注 Text
+            text_out, text_attn = self.text_attn(queries, text_kv, text_kv)
+            queries = self.norm2(queries + self.dropout(text_out))
+            
+            # 保存权重供可视化 (Detach 以节省显存)
+            self.last_text_attn_weights = text_attn.detach().cpu()
+        
+        # 3. TS Extraction (时序提取)
+        # Cross-Attention: Query 关注 Time Series Patch
+        ts_out, ts_attn = self.ts_attn(queries, ts_embeds, ts_embeds)
+        queries = self.norm3(queries + self.dropout(ts_out))
+        
+        # 保存权重供可视化
+        self.last_ts_attn_weights = ts_attn.detach().cpu()
+        
+        # 4. FFN
+        queries = self.norm4(queries + self.dropout(self.ffn(queries)))
+        
+        return queries
+
+
 class QFormer(nn.Module):
     """
-    模块 III 分支 A：Text-Guided Q-Former (方案 B+ 增强版).
-    包含：
-    1. Cross-Attention 文本引导
-    2. Attention 权重暴露 (用于可视化)
-    3. 全面 Dropout (防止过拟合)
+    多层迭代式 Q-Former (Iterative Q-Former)。
+    通过多层交互，实现深度的文本引导和特征精炼。
     """
     def __init__(self, config: CROMEConfig):
         super().__init__()
         self.config = config
         
-        dropout_rate = getattr(config, "dropout", 0.1)
-        
         # 1. 可学习的 Query Tokens (Base Queries)
+        # 这些 Token 是特征提取的“种子”
         self.query_tokens = nn.Parameter(
             torch.randn(config.query_tokens, config.patch_embedding_dim)
         )
+        # 使用正态分布初始化，这通常比全0初始化更容易训练
+        nn.init.normal_(self.query_tokens, std=0.02)
         
-        # 2. 文本交互层 (Text Interaction)
-        self.layernorm_text_input = nn.LayerNorm(config.llm_embed_dim) # 注意维度是 llm_embed_dim
-        self.text_proj = nn.Linear(config.llm_embed_dim, config.patch_embedding_dim)
-        # Cross-Attention: Query 关注 Text
-        self.text_attn = nn.MultiheadAttention(
-            embed_dim=config.patch_embedding_dim,
-            num_heads=config.patch_num_heads,
-            dropout=dropout_rate, 
-            batch_first=True
-        )
-        self.ln_text = nn.LayerNorm(config.patch_embedding_dim)
-
-        # 3. 时序提取层 (Time-Series Extraction)
-        # Cross-Attention: Query 关注 TS Patch
-        self.ln_ts_input = nn.LayerNorm(config.patch_embedding_dim)
-        self.ts_attn = nn.MultiheadAttention(
-            embed_dim=config.patch_embedding_dim,
-            num_heads=config.patch_num_heads,
-            dropout=dropout_rate,
-            batch_first=True
-        )
-        self.ln_ts = nn.LayerNorm(config.patch_embedding_dim)
+        # 2. 堆叠多层 QFormerLayer
+        # 建议层数：4 到 6 层。如果 config 中没有定义，默认使用 4 层。
+        # 你可以在 CROMEConfig 中添加 qformer_layers 属性来控制
+        num_layers = getattr(config, "qformer_layers", 4) 
         
-        self.dropout = nn.Dropout(dropout_rate)
-
-        # nn.init.zeros_(self.text_proj.weight)
-        # nn.init.zeros_(self.text_proj.bias)
-        nn.init.xavier_uniform_(self.text_proj.weight)
-        if self.text_proj.bias is not None:
-            nn.init.zeros_(self.text_proj.bias)
-
+        self.layers = nn.ModuleList([
+            QFormerLayer(config) for _ in range(num_layers)
+        ])
+        
+        # 暴露最后一层的 attention map 供外部调用 (例如 plot.py)
         self.last_text_attn_weights = None
 
     def forward(self, patch_tokens: Tensor, instruction_embeds: Optional[Tensor] = None) -> Tensor:
+        """
+        patch_tokens: [Batch, Num_Patches, Dim] (来自 Encoder)
+        instruction_embeds: [Batch, Text_Len, LLM_Dim] (来自 LLM)
+        """
         b = patch_tokens.size(0)
         
-        # 1. 扩展 Base Query
-        queries = self.query_tokens.unsqueeze(0).expand(b, -1, -1) # [B, 32, D]
+        # 1. 扩展 Query Tokens: [1, N_q, D] -> [B, N_q, D]
+        queries = self.query_tokens.unsqueeze(0).expand(b, -1, -1)
         
-        # 重置可视化权重 (防止 Text Dropout 时残留旧权重)
-        self.last_text_attn_weights = None
-        
-        # 2. [阶段一] 文本引导：Query 主动“读取”指令
-        if instruction_embeds is not None:
-            # instruction_embeds: [B, Text_Len, LLM_Dim]
+        # 2. 迭代式更新 Query
+        # 每一层 Query 都会变得更加“聪明”，因为它反复看了文本和数据
+        for layer in self.layers:
+            queries = layer(queries, instruction_embeds, patch_tokens)
             
-            # (A) 类型转换 (解决 BF16 vs FP32 冲突)
-            instruction_embeds = instruction_embeds.to(dtype=self.text_proj.weight.dtype)
-
-            # (B) 投影文本特征
-            text_kv = self.text_proj(instruction_embeds) # [B, Text_Len, D]
-            # text_kv = self.ln_text_input(text_kv)
+        # 3. 记录最后一层的 Attention Map (为了兼容旧的可视化代码)
+        self.last_text_attn_weights = self.layers[-1].last_text_attn_weights
             
-            # (C) Cross-Attention: Q=Queries, K=Text, V=Text
-            text_out, attn_weights = self.text_attn(
-                query=queries,
-                key=text_kv,
-                value=text_kv
-            )
-            
-            # 保存权重供可视化 (Detach + CPU 以节省显存)
-            # 形状通常为 [Batch, Queries, Text_Len] (若 average_attn_weights=True)
-            self.last_text_attn_weights = attn_weights.detach().cpu()
-            
-            # (D) 残差 + Norm + Dropout
-            # 注意：这里采用了 Pre-Norm 或 Post-Norm 结构均可，这里维持原有的 Post-Norm 逻辑
-            # Query = Norm(Query + Dropout(Attn(Q, Text)))
-            queries = self.ln_text(queries + self.dropout(text_out))
-        
-        # 3. [阶段二] 时序提取：带着意图的 Query 提取时序特征
-        # Q=Queries(Text-Aware), K=TS_Patch, V=TS_Patch
-        patch_tokens_norm = self.ln_ts_input(patch_tokens)
-        ts_out, _ = self.ts_attn(
-            query=queries, 
-            key=patch_tokens_norm, 
-            value=patch_tokens
-        )
-        
-        # 输出前应用 Dropout
-        return self.ln_ts(self.dropout(ts_out))
-
+        return queries
 
 class DetailProjection(nn.Module):
     def __init__(self, config: CROMEConfig, input_dim: int = None):
