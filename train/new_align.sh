@@ -12,7 +12,7 @@ fi
 
 # 训练参数配置
 LAST_MODEL="new16"
-MODEL_SUFFIX="8b_tattn_16_1208_stride8_residual_data_new"
+MODEL_SUFFIX="8b_tattn_16_1208_stride8_residual_cnn"
 
 # 数据路径定义
 PRETRAINED_PATH="model/encoder_$LAST_MODEL.pth"
@@ -38,7 +38,7 @@ LR=1e-3
 SEQ_LEN=2048
 PATCH_LEN=16
 PATCH_STRIDE=8
-WEIGHT_DECAY=0.01
+WEIGHT_DECAY=0.05
 
 echo "=========================================="
 echo "ChatTS 对齐训练 (Mix: Align+IFT, Val: Align 10%)"

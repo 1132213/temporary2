@@ -122,7 +122,7 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
                     pred = tokenizer.decode(outs[0], skip_special_tokens=True)
                     
                     # --- 后处理 ---
-                    stop_words = ["<|im_end|>", "<|im_start|>", "user", "model"]
+                    stop_words = ["<|im_end|>", "<|im_start|>"]
                     for stop_word in stop_words:
                         idx = pred.find(stop_word)
                         if idx != -1:

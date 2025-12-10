@@ -9,6 +9,86 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
+class ResBlock1D(nn.Module):
+    def __init__(self, channels, kernel_size=3, dilation=1, dropout=0.1):
+        super().__init__()
+        
+        # 第一层卷积
+        self.conv1 = nn.Conv1d(
+            channels, channels, kernel_size, 
+            padding=dilation*(kernel_size//2), dilation=dilation
+        )
+        #使用 GroupNorm (对 Batch Size 不敏感)
+        # num_groups=32 是经典设置，如果 channels < 32，则 group=1 (相当于 LayerNorm)
+        groups = 32 if channels >= 32 else 1
+        self.norm1 = nn.GroupNorm(num_groups=groups, num_channels=channels)
+        
+        self.act = nn.GELU()
+        
+        #加入 Dropout 防止过拟合
+        self.dropout = nn.Dropout(dropout)
+        
+        # 第二层卷积
+        self.conv2 = nn.Conv1d(
+            channels, channels, kernel_size, 
+            padding=dilation*(kernel_size//2), dilation=dilation
+        )
+        self.norm2 = nn.GroupNorm(num_groups=groups, num_channels=channels)
+
+    def forward(self, x):
+        residual = x
+        
+        # 路径：Conv1 -> Norm -> Act -> Dropout -> Conv2 -> Norm
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.act(out)
+        out = self.dropout(out) # Dropout 通常加在激活函数后，第二层卷积前
+        
+        out = self.conv2(out)
+        out = self.norm2(out)
+        
+        # 残差相加后再过一次激活
+        return self.act(out + residual)
+
+class ResNetDetailEncoder(nn.Module):
+    def __init__(self, config: CROMEConfig, out_dim: int, stride: int = 8):
+        super().__init__()
+        
+        # 从 config 中读取 dropout 率，如果没有则默认 0.1
+        dropout_rate = getattr(config, "proj_dropout", 0.1)
+        
+        # 1. Stem: 降采样 + 维度提升
+        self.stem = nn.Conv1d(
+            in_channels=config.input_channels,
+            out_channels=out_dim // 2,
+            kernel_size=stride * 2 + 1,
+            stride=stride,
+            padding=stride,
+        )
+        # Stem 层也使用 GroupNorm
+        stem_channels = out_dim // 2
+        stem_groups = 32 if stem_channels >= 32 else 1
+        self.norm_stem = nn.GroupNorm(num_groups=stem_groups, num_channels=stem_channels)
+        self.act = nn.GELU()
+        
+        # 2. Body: 残差块 (传入 dropout)
+        self.layer1 = ResBlock1D(out_dim // 2, kernel_size=3, dilation=1, dropout=dropout_rate)
+        self.layer2 = ResBlock1D(out_dim // 2, kernel_size=3, dilation=2, dropout=dropout_rate)
+        
+        # 3. Output Projector
+        self.proj = nn.Conv1d(out_dim // 2, out_dim, 1)
+
+    def forward(self, x):
+        # x: [B, L, C] -> [B, C, L]
+        x = x.permute(0, 2, 1)
+        
+        x = self.act(self.norm_stem(self.stem(x)))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.proj(x)
+        
+        # Output: [B, D, N] -> [B, N, D]
+        return x.permute(0, 2, 1)
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=4096, base=10000, device=None):
         super().__init__()
@@ -784,28 +864,57 @@ class CROMETSModel(nn.Module):
         self.adapter = CROMEAdapter(config)
 
         self.decomp = SeriesDecomp(kernel_size=25)
-        self.resid_patch_len = 8  # 使用更小的 Patch
-        self.resid_stride = 4     # 配合 Stride=4 或 2
+        self.resid_stride = 8  #增大步长，解决显存问题
         
-
-        # (A) 残差特征的 Embedding (不包含位置信息)
-        self.resid_embedding = nn.Linear(
-            self.resid_patch_len * config.input_channels, 
-            config.patch_embedding_dim
+        # === 1. 细节流编码器 (CNN) ===
+        # 我们让 CNN 输出 256 维，剩下的维度留给 PE 和 Stats
+        self.cnn_feat_dim = 256 
+        self.detail_encoder = ResNetDetailEncoder(
+            config, 
+            out_dim=self.cnn_feat_dim, 
+            stride=self.resid_stride
         )
-        nn.init.xavier_uniform_(self.resid_embedding.weight)
         
-        # (B) 定义独立的 PE 维度 (例如 64 维)
-        self.pe_dim = 64 
+        # === 2. 辅助信息维度 ===
+        self.pe_dim = 64
+        self.stats_dim = 2 * config.input_channels # Mean + Std
+        
         self.resid_pos_encoding = FixedSinePositionalEncoding(
             dim=self.pe_dim, 
             scale=10000.0
         )
         
-        # (C) 初始化 DetailProjector
-        # 输入维度 = 特征维度 (512) + 位置维度 (64)
-        concat_dim = config.patch_embedding_dim + self.pe_dim
+        # === 3. 最终融合层 ===
+        # 输入: [CNN特征(256) + PE(64) + Stats(2)] = 322
+        # 输出: [patch_embedding_dim] (512)
+        concat_dim = self.cnn_feat_dim + self.pe_dim + self.stats_dim
+        
+        # 这里复用 DetailProjection 类，但它现在只负责最后的特征对齐，不再负责提取
         self.detail_proj = DetailProjection(config, input_dim=concat_dim)
+
+
+        # self.resid_patch_len = 8  # 使用更小的 Patch
+        # self.resid_stride = 4     # 配合 Stride=4 或 2
+        
+
+        # # (A) 残差特征的 Embedding (不包含位置信息)
+        # self.resid_embedding = nn.Linear(
+        #     self.resid_patch_len * config.input_channels, 
+        #     config.patch_embedding_dim
+        # )
+        # nn.init.xavier_uniform_(self.resid_embedding.weight)
+        
+        # # (B) 定义独立的 PE 维度 (例如 64 维)
+        # self.pe_dim = 64 
+        # self.resid_pos_encoding = FixedSinePositionalEncoding(
+        #     dim=self.pe_dim, 
+        #     scale=10000.0
+        # )
+        
+        # # (C) 初始化 DetailProjector
+        # # 输入维度 = 特征维度 (512) + 位置维度 (64)
+        # concat_dim = config.patch_embedding_dim + self.pe_dim
+        # self.detail_proj = DetailProjection(config, input_dim=concat_dim)
         
         # 独立的线性层，随机初始化
         # self.resid_embedding = nn.Linear(
@@ -840,26 +949,74 @@ class CROMETSModel(nn.Module):
         raw_embeds_global, deep_feats = self.shape_encoder(x) # 还是喂原始x效果最好
         query_tokens = self.qformer(deep_feats, instruction_embeds)
         
+        # (A) CNN 特征提取
+        # [B, L, 1] -> [B, N, 256]  (N = L / 8)
+        # 这一步自动完成了降采样和形状提取
+        cnn_feats = self.detail_encoder(x_resid)
+        b, n, _ = cnn_feats.shape
+        
+        # (B) 局部统计量 (Local Stats)
+        # 使用 AvgPool 模拟与 CNN 相同的降采样
+        # x: [B, L, C] -> [B, C, L]
+        x_permute = x.permute(0, 2, 1)
+        
+        # 局部均值 (Local Mean)
+        local_mean = F.avg_pool1d(x_permute, kernel_size=self.resid_stride, stride=self.resid_stride)
+        
+        # 局部标准差 (Local Std) - 稍微麻烦点，用 Var = E[x^2] - (E[x])^2 公式近似
+        x2_permute = x_permute ** 2
+        local_x2_mean = F.avg_pool1d(x2_permute, kernel_size=self.resid_stride, stride=self.resid_stride)
+        local_std = torch.sqrt(torch.clamp(local_x2_mean - local_mean ** 2, min=1e-6))
+        
+        # [B, C, N] -> [B, N, C]
+        local_mean = local_mean.permute(0, 2, 1)
+        local_std = local_std.permute(0, 2, 1)
+        
+        # 拼接统计量 [B, N, 2C]
+        local_stats = torch.cat([local_mean, local_std], dim=-1)
+        
+        # 确保长度对齐 (处理 Padding 导致的微小差异)
+        if local_stats.shape[1] != n:
+            # 简单截断或插值，通常 stride 一致时只会差 1
+            min_len = min(local_stats.shape[1], n)
+            local_stats = local_stats[:, :min_len, :]
+            cnn_feats = cnn_feats[:, :min_len, :]
+            n = min_len
+
+        # (C) 位置编码
+        pe = self.resid_pos_encoding(n, device=x.device, dtype=x.dtype)
+        pe = pe.unsqueeze(0).expand(b, -1, -1)
+        
+        # (D) 最终拼接
+        # [CNN(256) | PE(64) | Stats(2)]
+        resid_cat = torch.cat([cnn_feats, pe, local_stats], dim=-1)
+        
+        # (E) 投影对齐
+        detail_tokens = self.detail_proj(resid_cat)
+
+
+
+
         # 3. 辅流 (Detail): 看残差 (Patch=4)
         # 手动 Patching
         # [B, L, C] -> [B, N, P, C]
-        resid_patches = x_resid.unfold(dimension=1, size=self.resid_patch_len, step=self.resid_stride)
-        b, n, p, c = resid_patches.shape
-        resid_patches = resid_patches.contiguous().view(b, n, -1)
+        # resid_patches = x_resid.unfold(dimension=1, size=self.resid_patch_len, step=self.resid_stride)
+        # b, n, p, c = resid_patches.shape
+        # resid_patches = resid_patches.contiguous().view(b, n, -1)
         
-        # 使用独立 Embedding 层
-        resid_embeds = self.resid_embedding(resid_patches) # [B, N_resid, 512]
+        # # 使用独立 Embedding 层
+        # resid_embeds = self.resid_embedding(resid_patches) # [B, N_resid, 512]
 
-        # (B) 生成位置编码 [N, 64]
-        pe = self.resid_pos_encoding(n, device=resid_embeds.device, dtype=resid_embeds.dtype)
-        # (C) 扩展到 Batch [1, N, 64] -> [B, N, 64]
-        pe = pe.unsqueeze(0).expand(b, -1, -1)
+        # # (B) 生成位置编码 [N, 64]
+        # pe = self.resid_pos_encoding(n, device=resid_embeds.device, dtype=resid_embeds.dtype)
+        # # (C) 扩展到 Batch [1, N, 64] -> [B, N, 64]
+        # pe = pe.unsqueeze(0).expand(b, -1, -1)
         
-        # (D) 拼接: [B, N, 512+64]
-        resid_cat = torch.cat([resid_embeds, pe], dim=-1)
+        # # (D) 拼接: [B, N, 512+64]
+        # resid_cat = torch.cat([resid_embeds, pe], dim=-1)
         
-        # (E) 送入 Projector (576 -> 512)
-        detail_tokens = self.detail_proj(resid_cat)
+        # # (E) 送入 Projector (576 -> 512)
+        # detail_tokens = self.detail_proj(resid_cat)
         
         # pe = self.resid_pos_encoding(n, device=resid_embeds.device, dtype=resid_embeds.dtype)
         # resid_embeds = resid_embeds + pe.unsqueeze(0) # Broadcasting add
