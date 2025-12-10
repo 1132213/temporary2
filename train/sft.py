@@ -162,11 +162,9 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
     logger = None
     log_dir = None
     model_dir = None
-    
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent
     if rank == 0:
-        script_dir = Path(__file__).parent
-        project_root = script_dir.parent
-        
         log_dir = project_root / "log"
         model_dir = project_root / "model"
         log_dir.mkdir(exist_ok=True)

@@ -9,8 +9,6 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
-# === RoPE (Rotary Positional Embedding) 实现 ===
-
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=4096, base=10000, device=None):
         super().__init__()
@@ -76,7 +74,6 @@ class RoPESelfAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         # Apply RoPE
-        # rotary_emb 是一个 Callable，返回 (cos, sin)
         cos, sin = rotary_emb(v, seq_len=L)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -351,7 +348,7 @@ class PatchTSTEncoder(nn.Module):
 
 # class QFormer(nn.Module):
 #     """
-#     模块 III 分支 A：Text-Guided Q-Former (方案 B+ 增强版).
+#     模块 III 分支 A：Text-Guided Q-Former.
 #     包含：
 #     1. Cross-Attention 文本引导
 #     2. Attention 权重暴露 (用于可视化)
@@ -500,9 +497,6 @@ class QFormerLayer(nn.Module):
         
         # 2. Text Interaction (文本引导)
         if text_embeds is not None:
-            # === [修复点] ===
-            # text_embeds 是 BFloat16 (来自 LLM), text_proj 是 Float32 (来自 QFormer)
-            # 必须先将输入转为与权重一致的类型 (Float32)
             text_embeds_input = text_embeds.to(self.text_proj.weight.dtype)
             
             # 投影文本特征到当前维度
@@ -512,15 +506,12 @@ class QFormerLayer(nn.Module):
             text_out, text_attn = self.text_attn(queries, text_kv, text_kv)
             queries = self.norm2(queries + self.dropout(text_out))
             
-            # 保存权重供可视化 (Detach 以节省显存)
             self.last_text_attn_weights = text_attn.detach().cpu()
         
         # 3. TS Extraction (时序提取)
-        # Cross-Attention: Query 关注 Time Series Patch
         ts_out, ts_attn = self.ts_attn(queries, ts_embeds, ts_embeds)
         queries = self.norm3(queries + self.dropout(ts_out))
         
-        # 保存权重供可视化
         self.last_ts_attn_weights = ts_attn.detach().cpu()
         
         # 4. FFN
@@ -677,7 +668,7 @@ class CROMEAdapter(nn.Module):
         self, 
         query_tokens: Tensor, 
         patch_tokens: Tensor, 
-        sep_embed: Optional[Tensor] = None, # [新增]
+        sep_embed: Optional[Tensor] = None, # 
         gamma: Optional[Tensor] = None, 
         beta: Optional[Tensor] = None
     ) -> Tensor:
@@ -838,7 +829,7 @@ class CROMETSModel(nn.Module):
         self,
         channel_data: Tensor,
         instruction_embeds: Optional[Tensor] = None,
-        sep_embed: Optional[Tensor] = None, # [新增]
+        sep_embed: Optional[Tensor] = None, # 
     ) -> Tensor:
         x, stats = self.preprocessor(channel_data)
         gamma, beta = self.film_generator(stats)
@@ -891,7 +882,7 @@ class CROMETSModel(nn.Module):
     #     self,
     #     channel_data: Tensor,
     #     instruction_embeds: Optional[Tensor] = None,
-    #     sep_embed: Optional[Tensor] = None, # [新增]
+    #     sep_embed: Optional[Tensor] = None, # 
     # ) -> Tensor:
     #     x, stats = self.preprocessor(channel_data)
     #     gamma, beta = self.film_generator(stats)
@@ -960,7 +951,7 @@ class StatBypassCROMETS1(nn.Module):
             torch.randn(1, config.llm_embed_dim) * 0.02
         )
         
-        # [新增] 定义模态特殊标记 (随机初始化)
+        #  定义模态特殊标记 (随机初始化)
         # 使用 nn.Parameter 确保在 SFT/LoRA 时能被优化器捕获
         self.ts_start_token = nn.Parameter(torch.randn(1, 1, config.llm_embed_dim) * 0.02)
         self.ts_end_token   = nn.Parameter(torch.randn(1, 1, config.llm_embed_dim) * 0.02)
@@ -995,7 +986,7 @@ class StatBypassCROMETS1(nn.Module):
     ) -> Dict[str, Any]:
         """
         核心逻辑封装：统一构建训练和推理用的 Multimodal Embeddings。
-        拼接顺序：[Start] -> [Stats] -> [TS Features] -> [End] (方案 B)
+        拼接顺序：[Start] -> [Stats] -> [TS Features] -> [End] 
         """
         device = next(self.parameters()).device
         batch_size = len(input_texts)
@@ -1081,7 +1072,6 @@ class StatBypassCROMETS1(nn.Module):
                     sep_embed=self.feat_sep_token
                 )
                 
-                # [新增] Ablation Masking Logic
                 if mask_query or mask_detail:
                     num_q = self.config.query_tokens
                     # ts_tokens 结构: [Batch=1, Num_Tokens, Dim]
@@ -1091,8 +1081,6 @@ class StatBypassCROMETS1(nn.Module):
                         ts_tokens[:, :num_q, :] = 0.0
                     
                     if mask_detail:
-                        # 如果有 sep_token，则 Detail 从 num_q + 1 开始
-                        # 当前实现中 self.feat_sep_token 始终初始化，故有 Sep
                         start_idx = num_q + 1
                         ts_tokens[:, start_idx:, :] = 0.0
 

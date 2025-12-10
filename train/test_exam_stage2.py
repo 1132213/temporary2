@@ -92,16 +92,12 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
                 
                 # --- Prompt 构造策略 ---
                 if enable_cot:
-                    # 策略 A: CoT 模式
-                    cot_suffix = "\nLet's analyze step by step. At the end, state the answer as 'The answer is <Option>'."
+                    cot_suffix = "\nPlease answer the question and provide the correct option letter, e.g., A), B), C), D), and option content at the end of your answer. All information need to answer the question is given. If you are unsure, please provide your best guess."
                     full_input = f"<|im_start|>user\n{original_input}{cot_suffix}<|im_end|>\n<|im_start|>assistant\n"
-                    
-                    max_new_tokens = 512 
+                    max_new_tokens = 2048 
                     stop_prefix = None
                 else:
-                    # 策略 B: Direct 模式
                     full_input = f"<|im_start|>user\n{original_input}<|im_end|>\n<|im_start|>assistant\nThe answer is option"
-                    
                     max_new_tokens = 16 
                     stop_prefix = "The answer is option" 
 
@@ -160,12 +156,24 @@ def generate_predictions(model, dataloader, device, output_file, rank, max_sampl
 def extract_answer_option(text):
     if not text: return "None"
     text = text.strip()
+    
+    # [新增] 如果包含 <think>，尝试去掉思考过程，只看最后的部分
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+    
+    # 1. 优先匹配明确的结束语
     match = re.search(r'The answer is\s*[:\-\s]*([A-D])', text, re.IGNORECASE)
     if match: return match.group(1).upper()
+    
+    # 2. 匹配 "Option A" 这种格式
+    match = re.search(r'Option\s*([A-D])', text, re.IGNORECASE)
+    if match: return match.group(1).upper()
+
+    # 3. 最后的兜底：找文本中最后出现的 A-D 选项
+    # (风险：可能会匹配到思考过程中的选项，但对于 CoT 来说通常最后一句是结论)
     matches = re.findall(r'\b([A-D])\b', text.upper())
     if matches: return matches[-1]
-    match = re.match(r'^([A-D])([.,:;)]|$)', text.upper())
-    if match: return match.group(1)
+    
     return "None"
 
 def evaluate_exam_results_with_regex(results_list):
@@ -291,8 +299,46 @@ def main():
         
     if rank == 0: print(f">>> Loading Stage 2 Checkpoint: {args.checkpoint}")
     
+    # === [修改重点] 加载权重并打印缺失/冲突 key ===
     state_dict = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state_dict, strict=False)
+    
+    # 尝试加载，允许不匹配 (strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    if rank == 0:
+        # 智能过滤：忽略我们已知不需要加载的 key
+        # 1. 忽略 LLM 自身的 key (因为它们是 Frozen 的，通常不保存在 checkpoint 里)
+        real_missing = [k for k in missing_keys if not k.startswith("llm.model")]
+        # 2. 忽略 mask_token 和 head (来自 Stage 1 预训练任务，推理时不需要)
+        real_missing = [k for k in real_missing if "mask_token" not in k and "head." not in k]
+        
+        # 3. 忽略 pos_encoding (因为我们现在用 RoPE，旧权重里可能有残留的 pos_encoding)
+        real_unexpected = [k for k in unexpected_keys if "pos_encoding" not in k]
+
+        print("\n" + "="*50)
+        print(f"Weight Loading Report for {args.checkpoint}")
+        print("="*50)
+        
+        if len(real_missing) > 0:
+            print(f"!!! MISSING KEYS ({len(real_missing)}) [Critical Warning] !!!")
+            # 只打印前 20 个，避免刷屏
+            for k in real_missing[:20]:
+                print(f"  - {k}")
+            if len(real_missing) > 20:
+                print(f"  ... and {len(real_missing) - 20} more.")
+        else:
+            print(">>> No critical missing keys.")
+
+        if len(real_unexpected) > 0:
+            print(f"\n!!! UNEXPECTED KEYS ({len(real_unexpected)}) [Check if Architecture Changed] !!!")
+            for k in real_unexpected[:20]:
+                print(f"  + {k}")
+            if len(real_unexpected) > 20:
+                print(f"  ... and {len(real_unexpected) - 20} more.")
+        else:
+            print(">>> No unexpected keys.")
+        print("="*50 + "\n")
+    # ========================================================
     
     ds = ExamChatTSDataset(
         args.jsonl_path, 

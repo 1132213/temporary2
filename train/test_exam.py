@@ -99,7 +99,7 @@ def generate_predictions(
                 if enable_cot:
                     cot_suffix = "\nPlease answer the question and provide the correct option letter, e.g., A), B), C), D), and option content at the end of your answer. All information need to answer the question is given. If you are unsure, please provide your best guess."
                     full_input = f"<|im_start|>user\n{original_input}{cot_suffix}<|im_end|>\n<|im_start|>assistant\n"
-                    max_new_tokens = 512 
+                    max_new_tokens = 2048 
                     stop_prefix = None
                 else:
                     full_input = f"<|im_start|>user\n{original_input}<|im_end|>\n<|im_start|>assistant\nThe answer is option"
@@ -166,12 +166,24 @@ def generate_predictions(
 def extract_answer_option(text):
     if not text: return "None"
     text = text.strip()
+    
+    # [新增] 如果包含 <think>，尝试去掉思考过程，只看最后的部分
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+    
+    # 1. 优先匹配明确的结束语
     match = re.search(r'The answer is\s*[:\-\s]*([A-D])', text, re.IGNORECASE)
     if match: return match.group(1).upper()
+    
+    # 2. 匹配 "Option A" 这种格式
+    match = re.search(r'Option\s*([A-D])', text, re.IGNORECASE)
+    if match: return match.group(1).upper()
+
+    # 3. 最后的兜底：找文本中最后出现的 A-D 选项
+    # (风险：可能会匹配到思考过程中的选项，但对于 CoT 来说通常最后一句是结论)
     matches = re.findall(r'\b([A-D])\b', text.upper())
     if matches: return matches[-1]
-    match = re.match(r'^([A-D])([.,:;)]|$)', text.upper())
-    if match: return match.group(1)
+    
     return "None"
 
 def evaluate_exam_results_with_regex(results_list):
@@ -312,6 +324,8 @@ def main():
         
         if len(msg.missing_keys) > 0:
             print(f"    ! Warning: First 5 missing keys: {msg.missing_keys[:5]}")
+        if len(msg.unexpected_keys) > 0:
+            print(f"    ! Warning: First 5 unexpected keys: {msg.unexpected_keys[:5]}")
     
     ds = ExamChatTSDataset(
         args.jsonl_path, 
