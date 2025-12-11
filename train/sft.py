@@ -375,12 +375,12 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
     max_train_steps = args.epochs * num_update_steps_per_epoch
     
     # 2. 计算预热步数
-    warmup_steps = int(max_train_steps * 0.02)
+    warmup_steps = int(max_train_steps * 0.05)
     
     if rank == 0:
         logger.info(f">>> Scheduler: Cosine with Warmup")
         logger.info(f">>> Total Optimization Steps: {max_train_steps}")
-        logger.info(f">>> Warmup Steps: {warmup_steps} (Ratio: 0.02)")
+        logger.info(f">>> Warmup Steps: {warmup_steps} (Ratio: 0.05)")
         eval_steps_interval = int(len(train_loader) * args.eval_interval)
         logger.info(f">>> Eval Interval: Every {args.eval_interval} epoch (~{eval_steps_interval} steps)")
 

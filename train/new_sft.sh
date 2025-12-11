@@ -11,7 +11,7 @@ fi
 
 # 训练参数配置
 LAST_MODEL="8b_tattn_16_1208_stride8_residual_data_new"
-MODEL_SUFFIX="8b_tattn_16_1208_stride8_residual_data_new"
+MODEL_SUFFIX="8b_tattn_16_1211_stride8_residual_data_new"
 
 STAGE2_CHECKPOINT="model/aligned_$LAST_MODEL.pth"
 LLM_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-8B"
@@ -26,16 +26,16 @@ TEST_EXAM_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.jsonl"
 
 # 混合配置
 MIX_PATHS="$SFT_DATA,$IFT_DATA,$ALIGN_DATA"
-MIX_PROBS="0.5,0.3,0.2"
+MIX_PROBS="0.4,0.3,0.3"
 
 # 代码将从 SFT_DATA 切出 10% 做 Loss 验证，IFT 和 ALIGN 将 100% 参与训练
 EVAL_DATA="$SFT_DATA"
 
 # 训练超参数
 BATCH_SIZE=1
-GRADIENT_ACCUM=16
+GRADIENT_ACCUM=32
 EPOCHS=2
-LR=1e-4
+LR=5e-5
 SEQ_LEN=2048
 PATCH_LEN=16
 PATCH_STRIDE=8
@@ -65,8 +65,8 @@ CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --save-only-trainable \
     --seed 42 \
     --use-lora \
-    --lora-r 64 \
-    --lora-alpha 128 \
+    --lora-r 128 \
+    --lora-alpha 256 \
     --eval-interval $INTERVAL "
     
 
