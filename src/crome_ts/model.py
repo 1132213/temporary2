@@ -9,6 +9,157 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
+
+class InstructionRefiner(nn.Module):
+    def __init__(self, config: CROMEConfig):
+        super().__init__()
+        self.embed_dim = config.llm_embed_dim
+        self.num_queries = config.num_task_queries
+        
+        # 1. 可学习的任务查询向量 (Task Queries)
+        # 形状: [1, Num_Queries, LLM_Dim]
+        self.task_queries = nn.Parameter(
+            torch.randn(1, self.num_queries, self.embed_dim)
+        )
+        nn.init.normal_(self.task_queries, std=0.02)
+        
+        # 2. Cross-Attention 层
+        # Query = Task Queries
+        # Key/Value = Raw Instruction Embeddings
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=4, # 4头足以处理语义聚类
+            batch_first=True,
+            dropout=config.proj_dropout
+        )
+        
+        # 3. LayerNorm (稳定训练)
+        self.norm = nn.LayerNorm(self.embed_dim)
+
+    def forward(self, instruction_embeds: Tensor) -> Tensor:
+        if instruction_embeds is None:
+            return None
+
+        B = instruction_embeds.shape[0]
+        ref = instruction_embeds  # ⭐ dtype / device 的唯一权威来源
+
+        # 1. Queries 对齐
+        queries = self.task_queries.expand(B, -1, -1).to(
+            dtype=ref.dtype,
+            device=ref.device
+        )
+
+        # 2. Cross-Attention 参数对齐
+        if self.cross_attn.in_proj_weight.dtype != ref.dtype:
+            self.cross_attn = self.cross_attn.to(
+                dtype=ref.dtype,
+                device=ref.device
+            )
+
+        # 3. LayerNorm 参数对齐（🔥 这次报错的根因）
+        if self.norm.weight.dtype != ref.dtype:
+            self.norm = self.norm.to(
+                dtype=ref.dtype,
+                device=ref.device
+            )
+
+        # 4. Cross Attention
+        task_embeds, _ = self.cross_attn(
+            query=queries,
+            key=ref,
+            value=ref
+        )
+
+        # 5. Norm
+        return self.norm(task_embeds)
+
+
+
+
+class CNNDetailEncoder(nn.Module):
+    def __init__(self, input_channels, patch_embedding_dim, dropout=0.1):
+        super().__init__()
+        
+        # 隐藏层维度
+        hidden_dim = 64 
+        
+        # 第一层投影
+        self.first_conv = nn.Conv1d(input_channels, hidden_dim, kernel_size=1)
+        
+        # 定义 3 个标准的残差块
+        # 坚持 Kernel=3, Dilation=1 (不膨胀), Padding=1 (保持长度)
+        # 这种结构只关注 "t" 时刻及其左右邻居，非常符合 "Micro" 的定义
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ) for _ in range(3) # 堆叠 3 层，足以提取复杂的微观特征
+        ])
+        
+        # 最终投影
+        self.final_proj = nn.Conv1d(hidden_dim, patch_embedding_dim, kernel_size=1)
+
+    def forward(self, x):
+        # x: [Batch, Channels, Seq_Len]
+        x = self.first_conv(x)
+        
+        for layer in self.layers:
+            residual = x
+            x = layer(x)
+            x = x + residual # ResNet 风格连接，训练更稳定
+            
+        x = self.final_proj(x)
+        return x.transpose(1, 2) # [B, L, D]
+class FusionGate(nn.Module):
+    def __init__(self, config: CROMEConfig):
+        super().__init__()
+        # [修改] 输出维度从 1 改为 patch_embedding_dim (例如 512)
+        self.proj = nn.Linear(config.llm_embed_dim, config.patch_embedding_dim)
+        
+    def forward(self, instruction_embeds):
+        if instruction_embeds is None:
+            return 0.5 
+        
+        pooled = instruction_embeds.mean(dim=1)
+        pooled = pooled.to(self.proj.weight.dtype)
+        
+        # [修改] 输出形状为 [B, 1, D]
+        # 这样 Gate 可以在不同的特征通道上分别决定“听宏观的”还是“听微观的”
+        gate = torch.sigmoid(self.proj(pooled)).unsqueeze(1) 
+        return gate
+# ---2. 特征融合门控 ---
+# class FusionGate(nn.Module):
+#     """
+#     根据指令语义，动态决定关注宏观趋势还是微观细节。
+#     """
+#     def __init__(self, config: CROMEConfig):
+#         super().__init__()
+#         # 输入是 LLM 的 Instruction Embedding
+#         self.proj = nn.Linear(config.llm_embed_dim, 1)
+        
+#     def forward(self, instruction_embeds):
+#         # instruction_embeds: [B, L_text, D_llm]
+#         if instruction_embeds is None:
+#             # 如果没有指令，默认 50/50 混合
+#             return 0.5 
+        
+#         # 对文本序列取均值作为句子表示
+#         # [B, L, D] -> [B, D]
+#         pooled = instruction_embeds.mean(dim=1)
+#         pooled = pooled.to(self.proj.weight.dtype)
+        
+#         # Sigmoid 映射到 [0, 1]
+#         # output: [B, 1, 1] 用于广播
+#         gate = torch.sigmoid(self.proj(pooled)).unsqueeze(1)
+#         return gate
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=4096, base=10000, device=None):
         super().__init__()
@@ -122,7 +273,8 @@ class CROMEConfig:
     patch_num_heads: int = 8
     patch_num_layers: int = 4
     freeze_patch_encoder: bool = False
-    query_tokens: int = 32
+    query_tokens: int = 64
+    num_task_queries: int = 8
     adapter_hidden_dim: int = 256
     fuse_mode: str = "add"
     epsilon: float = 1e-4
@@ -201,29 +353,11 @@ class InputPreprocessor(nn.Module):
         super().__init__()
         self.config = config
         self.revin = RevIN(config.epsilon)
-        # self.pos_encoding = FixedSinePositionalEncoding(config.input_channels)
-        # self.fuse_mode = config.fuse_mode
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         b, l, c = x.shape
         x_norm, stats = self.revin(x)
         return x_norm,stats
-        # if c != self.config.input_channels:
-        #     pos_encoding = FixedSinePositionalEncoding(c)
-        # else:
-        #     pos_encoding = self.pos_encoding
-        
-        # time_emb = pos_encoding(l, device=x.device, dtype=x.dtype)
-        # time_emb = time_emb.unsqueeze(0).expand(b, -1, -1)
-        
-        # if self.fuse_mode == "add":
-        #     fused = x_norm + time_emb
-        # elif self.fuse_mode == "concat":
-        #     fused = torch.cat([x_norm, time_emb], dim=-1)
-        # else:
-        #     raise ValueError(f"未知融合模式: {self.fuse_mode}")
-            
-        # return fused, stats
 
 
 class PatchEmbedding(nn.Module):
@@ -242,54 +376,6 @@ class PatchEmbedding(nn.Module):
         return self.project(patches)
 
 
-# class PatchTSTEncoder(nn.Module):
-#     """模块 II：冻结 PatchTST 形态编码器。"""
-#     def __init__(self, config: CROMEConfig, input_dim: int):
-#         super().__init__()
-#         self.config = config 
-#         self.embedding = PatchEmbedding(config, input_dim)
-#         self.pos_encoding = FixedSinePositionalEncoding(
-#             dim=config.patch_embedding_dim, 
-#             scale=10000.0
-#         )
-#         layer = nn.TransformerEncoderLayer(
-#             d_model=config.patch_embedding_dim,
-#             nhead=config.patch_num_heads,
-#             batch_first=True,
-#         )
-#         self.encoder = nn.TransformerEncoder(layer, num_layers=config.patch_num_layers)
-#         if config.freeze_patch_encoder:
-#             self._freeze()
-
-#     def _freeze(self) -> None:
-#         for p in self.parameters():
-#             p.requires_grad_(False)
-
-#     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-#         # x: [Batch, Seq_Len, Channels]
-        
-#         # 1. Patchify & Project
-#         # emb: [Batch, Num_Patches, Patch_Dim]
-#         emb = self.embedding(x) 
-        
-#         # 2. [核心修改] 动态生成 Patch 级位置编码
-#         # 获取当前的 patch 数量
-#         b, num_patches, d = emb.shape
-        
-#         # 生成对应的 PE: [Num_Patches, Patch_Dim]
-#         # 注意：这里传入的是 num_patches，代表“第几个Patch”，而不是“第几秒”
-#         pe = self.pos_encoding(num_patches, device=x.device, dtype=emb.dtype)
-        
-#         # 广播并相加: [1, N, D] + [B, N, D]
-#         emb = emb + pe.unsqueeze(0)
-
-#         if self.config.freeze_patch_encoder:
-#             with torch.no_grad():
-#                 enc_out = self.encoder(emb)
-#                 return emb, enc_out 
-#         else:
-#             enc_out = self.encoder(emb)
-#             return emb, enc_out 
 class PatchTSTEncoder(nn.Module):
     """模块 II：基于 RoPE 的 PatchTST 编码器。"""
     def __init__(self, config: CROMEConfig, input_dim: int):
@@ -346,105 +432,6 @@ class PatchTSTEncoder(nn.Module):
         else:
             return emb, x_out
 
-# class QFormer(nn.Module):
-#     """
-#     模块 III 分支 A：Text-Guided Q-Former.
-#     包含：
-#     1. Cross-Attention 文本引导
-#     2. Attention 权重暴露 (用于可视化)
-#     3. 全面 Dropout (防止过拟合)
-#     """
-#     def __init__(self, config: CROMEConfig):
-#         super().__init__()
-#         self.config = config
-        
-#         dropout_rate = getattr(config, "dropout", 0.1)
-        
-#         # 1. 可学习的 Query Tokens (Base Queries)
-#         self.query_tokens = nn.Parameter(
-#             torch.randn(config.query_tokens, config.patch_embedding_dim)
-#         )
-        
-#         # 2. 文本交互层 (Text Interaction)
-#         self.layernorm_text_input = nn.LayerNorm(config.llm_embed_dim) # 注意维度是 llm_embed_dim
-#         self.text_proj = nn.Linear(config.llm_embed_dim, config.patch_embedding_dim)
-#         # Cross-Attention: Query 关注 Text
-#         self.text_attn = nn.MultiheadAttention(
-#             embed_dim=config.patch_embedding_dim,
-#             num_heads=config.patch_num_heads,
-#             dropout=dropout_rate, 
-#             batch_first=True
-#         )
-#         self.ln_text = nn.LayerNorm(config.patch_embedding_dim)
-
-#         # 3. 时序提取层 (Time-Series Extraction)
-#         # Cross-Attention: Query 关注 TS Patch
-#         self.ln_ts_input = nn.LayerNorm(config.patch_embedding_dim)
-#         self.ts_attn = nn.MultiheadAttention(
-#             embed_dim=config.patch_embedding_dim,
-#             num_heads=config.patch_num_heads,
-#             dropout=dropout_rate,
-#             batch_first=True
-#         )
-#         self.ln_ts = nn.LayerNorm(config.patch_embedding_dim)
-        
-#         self.dropout = nn.Dropout(dropout_rate)
-
-#         # nn.init.zeros_(self.text_proj.weight)
-#         # nn.init.zeros_(self.text_proj.bias)
-#         nn.init.xavier_uniform_(self.text_proj.weight)
-#         if self.text_proj.bias is not None:
-#             nn.init.zeros_(self.text_proj.bias)
-
-#         self.last_text_attn_weights = None
-
-#     def forward(self, patch_tokens: Tensor, instruction_embeds: Optional[Tensor] = None) -> Tensor:
-#         b = patch_tokens.size(0)
-        
-#         # 1. 扩展 Base Query
-#         queries = self.query_tokens.unsqueeze(0).expand(b, -1, -1) # [B, 32, D]
-        
-#         # 重置可视化权重 (防止 Text Dropout 时残留旧权重)
-#         self.last_text_attn_weights = None
-        
-#         # 2. [阶段一] 文本引导：Query 主动“读取”指令
-#         if instruction_embeds is not None:
-#             # instruction_embeds: [B, Text_Len, LLM_Dim]
-            
-#             # (A) 类型转换 (解决 BF16 vs FP32 冲突)
-#             instruction_embeds = instruction_embeds.to(dtype=self.text_proj.weight.dtype)
-
-#             # (B) 投影文本特征
-#             text_kv = self.text_proj(instruction_embeds) # [B, Text_Len, D]
-#             # text_kv = self.ln_text_input(text_kv)
-            
-#             # (C) Cross-Attention: Q=Queries, K=Text, V=Text
-#             text_out, attn_weights = self.text_attn(
-#                 query=queries,
-#                 key=text_kv,
-#                 value=text_kv
-#             )
-            
-#             # 保存权重供可视化 (Detach + CPU 以节省显存)
-#             # 形状通常为 [Batch, Queries, Text_Len] (若 average_attn_weights=True)
-#             self.last_text_attn_weights = attn_weights.detach().cpu()
-            
-#             # (D) 残差 + Norm + Dropout
-#             # 注意：这里采用了 Pre-Norm 或 Post-Norm 结构均可，这里维持原有的 Post-Norm 逻辑
-#             # Query = Norm(Query + Dropout(Attn(Q, Text)))
-#             queries = self.ln_text(queries + self.dropout(text_out))
-        
-#         # 3. [阶段二] 时序提取：带着意图的 Query 提取时序特征
-#         # Q=Queries(Text-Aware), K=TS_Patch, V=TS_Patch
-#         patch_tokens_norm = self.ln_ts_input(patch_tokens)
-#         ts_out, _ = self.ts_attn(
-#             query=queries, 
-#             key=patch_tokens_norm, 
-#             value=patch_tokens
-#         )
-        
-#         # 输出前应用 Dropout
-#         return self.ln_ts(self.dropout(ts_out))
 class QFormerLayer(nn.Module):
     """
     Q-Former 的单层 Block。
@@ -654,35 +641,28 @@ class CROMEAdapterBlock(nn.Module):
         return x + self.up(z)
 
 
+# --- [修改] 3. 适配器 (丢弃 Detail Tokens 输入) ---
 class CROMEAdapter(nn.Module):
     def __init__(self, config: CROMEConfig):
         super().__init__()
+        # 只需要一个 Query Adapter
+        # 移除了原有的 patch_adapter
         self.query_adapter = CROMEAdapterBlock(
-            config.patch_embedding_dim, config.adapter_hidden_dim
-        )
-        self.patch_adapter = CROMEAdapterBlock(
             config.patch_embedding_dim, config.adapter_hidden_dim
         )
 
     def forward(
         self, 
         query_tokens: Tensor, 
-        patch_tokens: Tensor, 
-        sep_embed: Optional[Tensor] = None, # 
+        # patch_tokens: Tensor,  <-- 移除此参数
+        # sep_embed: Optional[Tensor] = None, <-- 移除此参数
         gamma: Optional[Tensor] = None, 
         beta: Optional[Tensor] = None
     ) -> Tensor:
-        query_out = self.query_adapter(query_tokens)
-        patch_out = self.patch_adapter(patch_tokens, gamma=gamma, beta=beta)
         
-        # [修改] 插入分隔符: [Query, Sep, Detail]
-        if sep_embed is not None:
-            # sep_embed shape: [1, 1, Dim] -> 扩展到 [B, 1, Dim]
-            b = query_tokens.size(0)
-            sep = sep_embed.expand(b, -1, -1)
-            return torch.cat([query_out, sep, patch_out], dim=1)
-        else:
-            return torch.cat([query_out, patch_out], dim=1)
+        # [关键修改] 将 FiLM 统计量 (Gamma/Beta) 注入到 Query Tokens 中
+        # 这确保了即使丢弃了 Detail Tokens，LLM 依然能感知到序列的幅度信息
+        return self.query_adapter(query_tokens, gamma=gamma, beta=beta)
 
 
 class InstructionTokenizer:
@@ -712,6 +692,7 @@ class FrozenLLM(nn.Module):
             config.llm_model_path,
             torch_dtype=dtype,
             device_map=config.llm_device_map,
+            attn_implementation="flash_attention_2"
         )
         self.model.eval()
         for p in self.model.parameters():
@@ -767,114 +748,164 @@ class SeriesDecomp(nn.Module):
         
         return x_resid, x_trend
 
+# ==========================================
+# 1. 修改 CNNDetailEncoder: 纯微观 ResNet-1D
+# ==========================================
+class CNNDetailEncoder(nn.Module):
+    """
+    纯微观细节编码器 (Pure Micro Encoder)。
+    特点：
+    1. 无池化 (No Pooling)：绝对不丢失高频细节。
+    2. 无膨胀 (No Dilation)：只关注局部 (Kernel=3)，不越界去管宏观。
+    3. ResNet结构：深层特征提取，训练稳定。
+    """
+    def __init__(self, input_channels: int, patch_embedding_dim: int, dropout: float = 0.1):
+        super().__init__()
+        
+        # 隐藏层维度
+        hidden_dim = 64 
+        
+        # 第一层投影: 将输入 (Resid+Diff) 映射到隐藏空间
+        self.first_conv = nn.Conv1d(input_channels, hidden_dim, kernel_size=1)
+        
+        # 定义 3 个标准的残差块
+        # 坚持 Kernel=3, Dilation=1 (不膨胀), Padding=1 (保持长度)
+        # 这种结构只关注 "t" 时刻及其左右邻居，非常符合 "Micro" 的定义
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ) for _ in range(3) # 堆叠 3 层，足以提取复杂的微观特征
+        ])
+        
+        # 最终投影到 PatchTST 的维度，以便 Q-Former 处理
+        self.final_proj = nn.Conv1d(hidden_dim, patch_embedding_dim, kernel_size=1)
+
+    def forward(self, x):
+        # x input shape: [Batch, Channels, Seq_Len]
+        # Channels = 2 (Resid + Diff)
+        
+        x = self.first_conv(x)
+        
+        for layer in self.layers:
+            residual = x
+            x = layer(x)
+            x = x + residual # ResNet 风格连接
+            
+        x = self.final_proj(x)
+        
+        # 输出形状: [Batch, Dim, Seq_Len]
+        # 转置为 [Batch, Seq_Len, Dim] 给 Q-Former
+        return x.transpose(1, 2)
+
+
+# ==========================================
+# 2. 修改 CROMETSModel: 初始化与双流逻辑
+# ==========================================
 class CROMETSModel(nn.Module):
     def __init__(self, config: CROMEConfig):
         super().__init__()
         self.config = config
+        
+        # 1. 预处理
+        self.preprocessor = InputPreprocessor(config)
+        
+        # 2. Macro 流编码器
         pre_input_dim = (
             config.input_channels if config.fuse_mode == "add" else config.input_channels * 2
         )
-        self.preprocessor = InputPreprocessor(config)
         self.shape_encoder = PatchTSTEncoder(config, pre_input_dim)
-        # 使用新的 Text-Guided QFormer
-        self.qformer = QFormer(config)
-        self.detail_proj = DetailProjection(config)
         
+        # 3. Micro 流编码器 (纯微观 ResNet)
+        self.decomp = SeriesDecomp(kernel_size=65) # 保持 Kernel=65
+        self.detail_encoder = CNNDetailEncoder(
+            input_channels=2, # Resid + Diff
+            patch_embedding_dim=config.patch_embedding_dim,
+            dropout=config.proj_dropout
+        )
+        
+        # ==========================================
+        # [新增] 4. 指令蒸馏器
+        # ==========================================
+        self.instr_refiner = InstructionRefiner(config)
+        
+        # 5. Q-Former, FiLM, Adapter
+        self.qformer = QFormer(config)
         self.film_generator = RobustFiLMGenerator(config)
         self.adapter = CROMEAdapter(config)
-
-        self.decomp = SeriesDecomp(kernel_size=25)
-        self.resid_patch_len = 8  # 使用更小的 Patch
-        self.resid_stride = 4     # 配合 Stride=4 或 2
         
-
-        # (A) 残差特征的 Embedding (不包含位置信息)
-        self.resid_embedding = nn.Linear(
-            self.resid_patch_len * config.input_channels, 
-            config.patch_embedding_dim
-        )
-        nn.init.xavier_uniform_(self.resid_embedding.weight)
+        # 6. 融合门控
+        self.fusion_gate = FusionGate(config)
         
-        # (B) 定义独立的 PE 维度 (例如 64 维)
-        self.pe_dim = 64 
-        self.resid_pos_encoding = FixedSinePositionalEncoding(
-            dim=self.pe_dim, 
-            scale=10000.0
-        )
-        
-        # (C) 初始化 DetailProjector
-        # 输入维度 = 特征维度 (512) + 位置维度 (64)
-        concat_dim = config.patch_embedding_dim + self.pe_dim
-        self.detail_proj = DetailProjection(config, input_dim=concat_dim)
-        
-        # 独立的线性层，随机初始化
-        # self.resid_embedding = nn.Linear(
-        #     self.resid_patch_len * config.input_channels, 
-        #     config.patch_embedding_dim
-        # )
-        # nn.init.xavier_uniform_(self.resid_embedding.weight)
-        # self.resid_pos_encoding = FixedSinePositionalEncoding(
-        #     dim=config.patch_embedding_dim, 
-        #     scale=10000.0
-        # )
-        
-        # self.llm_proj = nn.Linear(config.patch_embedding_dim, config.llm_embed_dim)
+        # 7. LLM 投影
         self.llm_proj = nn.Sequential(
             nn.Linear(config.patch_embedding_dim, config.llm_embed_dim),
             nn.GELU(),
             nn.Dropout(config.proj_dropout),
             nn.Linear(config.llm_embed_dim, config.llm_embed_dim)
         )
+
     def _process_single_channel(
         self,
         channel_data: Tensor,
         instruction_embeds: Optional[Tensor] = None,
-        sep_embed: Optional[Tensor] = None, # 
+        sep_embed: Optional[Tensor] = None,
     ) -> Tensor:
+        # =========================================================
+        # [步骤 0] 指令蒸馏 (Instruction Refinement)
+        # =========================================================
+        # 将原始的含指代指令 (Raw) 转化为纯任务指令 (Refined)
+        # task_embeds: [B, Num_Task_Queries, LLM_Dim]
+        # 这里的 task_embeds 将替代 raw instruction_embeds 传给下游
+        task_embeds = self.instr_refiner(instruction_embeds)
+        
+        # 如果蒸馏器返回 None (即没有输入指令)，则沿用 None，
+        # 下游的 Gate 会处理 None (返回 0.5)，QFormer 也会处理 None (不进行 Text Attention)
+        
+        # 1. 预处理与分解
         x, stats = self.preprocessor(channel_data)
         gamma, beta = self.film_generator(stats)
-        # 1. 分解
+        
+        # Kernel=65 分解
         x_resid, x_trend = self.decomp(x)
         
-        # 2. 主流 (Query): 看趋势 (Patch=16)
-        raw_embeds_global, deep_feats = self.shape_encoder(x) # 还是喂原始x效果最好
-        query_tokens = self.qformer(deep_feats, instruction_embeds)
+        # 2. Macro 流：兜底看 Raw
+        _, deep_feats = self.shape_encoder(x)
         
-        # 3. 辅流 (Detail): 看残差 (Patch=4)
-        # 手动 Patching
-        # [B, L, C] -> [B, N, P, C]
-        resid_patches = x_resid.unfold(dimension=1, size=self.resid_patch_len, step=self.resid_stride)
-        b, n, p, c = resid_patches.shape
-        resid_patches = resid_patches.contiguous().view(b, n, -1)
+        # 3. Micro 流：Resid + Diff
+        x_t = x.permute(0, 2, 1)        # [B, 1, L]
+        x_resid_t = x_resid.permute(0, 2, 1) # [B, 1, L]
+        x_diff_t = torch.diff(x_t, dim=2, prepend=x_t[:, :, :1])
         
-        # 使用独立 Embedding 层
-        resid_embeds = self.resid_embedding(resid_patches) # [B, N_resid, 512]
-
-        # (B) 生成位置编码 [N, 64]
-        pe = self.resid_pos_encoding(n, device=resid_embeds.device, dtype=resid_embeds.dtype)
-        # (C) 扩展到 Batch [1, N, 64] -> [B, N, 64]
-        pe = pe.unsqueeze(0).expand(b, -1, -1)
+        micro_input = torch.cat([x_resid_t, x_diff_t], dim=1) # [B, 2, L]
+        detail_feats = self.detail_encoder(micro_input)
         
-        # (D) 拼接: [B, N, 512+64]
-        resid_cat = torch.cat([resid_embeds, pe], dim=-1)
+        # =========================================================
+        # 4. 独立查询 (使用 task_embeds 替代 instruction_embeds)
+        # =========================================================
         
-        # (E) 送入 Projector (576 -> 512)
-        detail_tokens = self.detail_proj(resid_cat)
+        # (A) 查询宏观趋势
+        # Q-Former 内部 Cross-Attn 现在看到的是纯粹的任务语义
+        q_macro = self.qformer(deep_feats, task_embeds)
         
-        # pe = self.resid_pos_encoding(n, device=resid_embeds.device, dtype=resid_embeds.dtype)
-        # resid_embeds = resid_embeds + pe.unsqueeze(0) # Broadcasting add
+        # (B) 查询微观细节
+        q_micro = self.qformer(detail_feats, task_embeds)
         
-        # # 送入 Detail Projector
-        # detail_tokens = self.detail_proj(resid_embeds)
+        # 5. 动态融合 (使用 task_embeds)
+        # Gate 会对 task_embeds 进行 Pooling，然后决定权重
+        # 由于 task_embeds 是“提纯”过的，Gate 判别会更准
+        gate = self.fusion_gate(task_embeds) 
         
-        # 4. 融合
-        # 注意: 此时 detail_tokens 的长度 (N_resid) 是 query_tokens (32) 或原 patch (N_main) 的 4 倍
-        # Adapter 和 LLM 可以处理变长序列，直接拼接即可
-        ts_tokens = self.adapter(
-            query_tokens, detail_tokens, 
-            sep_embed=sep_embed, 
-            gamma=gamma, beta=beta
-        )
+        q_fused = gate * q_macro + (1 - gate) * q_micro
+        
+        # 6. Adapter & Projection
+        ts_tokens = self.adapter(q_fused, gamma=gamma, beta=beta)
         ts_tokens = self.llm_proj(ts_tokens)
         
         return ts_tokens
@@ -906,37 +937,37 @@ class CROMETSModel(nn.Module):
         
     #     return ts_tokens
 
-    def forward(
-        self,
-        raw_series: Tensor,
-        text_prefix: Tensor,
-        text_suffix: Tensor,
-        instruction_embeds: Optional[Tensor] = None,
-    ) -> Dict[str, Tensor]:
-        target_dtype = text_prefix.dtype
-        x, stats = self.preprocessor(raw_series)
-        gamma, beta = self.film_generator(stats)
+    # def forward(
+    #     self,
+    #     raw_series: Tensor,
+    #     text_prefix: Tensor,
+    #     text_suffix: Tensor,
+    #     instruction_embeds: Optional[Tensor] = None,
+    # ) -> Dict[str, Tensor]:
+    #     target_dtype = text_prefix.dtype
+    #     x, stats = self.preprocessor(raw_series)
+    #     gamma, beta = self.film_generator(stats)
         
-        raw_embeds, deep_feats = self.shape_encoder(x)
+    #     raw_embeds, deep_feats = self.shape_encoder(x)
         
-        query_tokens = self.qformer(deep_feats, instruction_embeds)
-        detail_tokens = self.detail_proj(raw_embeds)
+    #     query_tokens = self.qformer(deep_feats, instruction_embeds)
+    #     detail_tokens = self.detail_proj(raw_embeds)
         
-        # 通用 forward 暂时不处理 sep_embed，或者也可以加上
-        ts_tokens = self.adapter(query_tokens, detail_tokens, gamma=gamma, beta=beta)
-        ts_tokens = self.llm_proj(ts_tokens)
+    #     # 通用 forward 暂时不处理 sep_embed，或者也可以加上
+    #     ts_tokens = self.adapter(query_tokens, detail_tokens, gamma=gamma, beta=beta)
+    #     ts_tokens = self.llm_proj(ts_tokens)
         
-        if ts_tokens.dtype != target_dtype:
-            ts_tokens = ts_tokens.to(dtype=target_dtype)
+    #     if ts_tokens.dtype != target_dtype:
+    #         ts_tokens = ts_tokens.to(dtype=target_dtype)
             
-        assembled = torch.cat(
-            [text_prefix, ts_tokens, text_suffix],
-            dim=1,
-        )
-        return {
-            "ts_tokens": ts_tokens,
-            "assembled": assembled,
-        }
+    #     assembled = torch.cat(
+    #         [text_prefix, ts_tokens, text_suffix],
+    #         dim=1,
+    #     )
+    #     return {
+    #         "ts_tokens": ts_tokens,
+    #         "assembled": assembled,
+    #     }
 
 
 class StatBypassCROMETS1(nn.Module):
@@ -956,7 +987,7 @@ class StatBypassCROMETS1(nn.Module):
         self.ts_start_token = nn.Parameter(torch.randn(1, 1, config.llm_embed_dim) * 0.02)
         self.ts_end_token   = nn.Parameter(torch.randn(1, 1, config.llm_embed_dim) * 0.02)
         # self.feat_sep_token = nn.Parameter(torch.randn(1, 1, config.llm_embed_dim) * 0.02)
-        self.feat_sep_token = nn.Parameter(torch.randn(1, 1, config.patch_embedding_dim) * 0.02)
+        # self.feat_sep_token = nn.Parameter(torch.randn(1, 1, config.patch_embedding_dim) * 0.02)
 
     def _prepare_text(
         self,
@@ -1068,21 +1099,11 @@ class StatBypassCROMETS1(nn.Module):
                 ts_batch = ts_tensor.unsqueeze(0)
                 ts_tokens = self.ts_model._process_single_channel(
                     ts_batch, 
-                    instruction_embeds=current_instruction_embeds,
-                    sep_embed=self.feat_sep_token
+                    instruction_embeds=current_instruction_embeds
                 )
                 
-                if mask_query or mask_detail:
-                    num_q = self.config.query_tokens
-                    # ts_tokens 结构: [Batch=1, Num_Tokens, Dim]
-                    # 结构顺序: [Query(0:num_q), Sep(num_q), Detail(num_q+1:)]
-                    
-                    if mask_query:
-                        ts_tokens[:, :num_q, :] = 0.0
-                    
-                    if mask_detail:
-                        start_idx = num_q + 1
-                        ts_tokens[:, start_idx:, :] = 0.0
+                if mask_query:
+                    ts_tokens.fill_(0.0)
 
                 if ts_tokens.dtype != target_dtype:
                     ts_tokens = ts_tokens.to(dtype=target_dtype)

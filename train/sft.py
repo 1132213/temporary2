@@ -1,16 +1,5 @@
 import sys
 from pathlib import Path
-
-# 路径设置：确保能找到 src 和 test 包
-project_root = Path(__file__).resolve().parent.parent
-project_root_str = str(project_root)
-if project_root_str not in sys.path:
-    sys.path.insert(0, project_root_str)
-
-# 引入项目模块
-from src.crome_ts.model import CROMEConfig, StatBypassCROMETS1, get_llm_embed_dim
-from src.crome_ts.data_instruct import ChatTSDataset, chatts_collate_fn, WeightedMixingDataset
-from test.common import set_seed
 import argparse
 import torch
 import torch.distributed as dist
@@ -18,22 +7,39 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from transformers import get_cosine_schedule_with_warmup
 from tqdm import tqdm
 import logging
 from datetime import datetime
 import math
 import os
-import subprocess 
-from transformers import get_cosine_schedule_with_warmup
 
-# === 新增：PEFT 库 ===
+# --- 项目模块导入 ---
+project_root = Path(__file__).resolve().parent.parent
+project_root_str = str(project_root)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
+
+from src.crome_ts.model import CROMEConfig, StatBypassCROMETS1, get_llm_embed_dim
+from src.crome_ts.data_instruct import ChatTSDataset, chatts_collate_fn, WeightedMixingDataset
+from test.common import set_seed
+
+# === [修改点] 导入 autoeval 模块 ===
+try:
+    from train.autoeval import run_internal_eval
+except ImportError:
+    try:
+        from autoeval import run_internal_eval
+    except ImportError:
+        print("Warning: Could not import 'run_internal_eval' from autoeval.py. Auto-eval will fail.")
+        run_internal_eval = None
+
+# === PEFT 库 ===
 try:
     from peft import get_peft_model, LoraConfig, TaskType
     PEFT_AVAILABLE = True
 except ImportError:
     PEFT_AVAILABLE = False
-    print("Warning: peft not installed. LoRA will not be available.")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -164,6 +170,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
     model_dir = None
     script_dir = Path(__file__).parent
     project_root = script_dir.parent
+    
     if rank == 0:
         log_dir = project_root / "log"
         model_dir = project_root / "model"
@@ -182,7 +189,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
     
     set_seed(args.seed + rank)
 
-    # 1. 配置
+    # 1. 配置与模型初始化
     llm_embed_dim = get_llm_embed_dim(args.llm_model_path)
     if rank == 0 and logger:
         logger.info(f">>> LLM Embedding Dimension: {llm_embed_dim} (from {args.llm_model_path})")
@@ -198,7 +205,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         llm_device_map=f"cuda:{local_rank}",
         llm_dtype="bfloat16",
         freeze_patch_encoder=args.freeze_encoder,
-        epsilon=1e-3, # 推荐: 1e-3 防止梯度爆炸
+        epsilon=1e-3, 
         proj_dropout=args.proj_dropout
     )
     
@@ -232,7 +239,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         if rank == 0 and logger:
             logger.warning(f"!!! Stage 2 checkpoint not found at {stage2_path}! Training from scratch (NOT RECOMMENDED). !!!")
 
-    # 3. LoRA
+    # 3. LoRA 配置
     if args.use_lora:
         if not PEFT_AVAILABLE:
             raise RuntimeError("PEFT library is not installed. Please install it to use LoRA.")
@@ -257,11 +264,16 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
     else:
         if rank == 0 and logger:
             logger.info(">>> Full Fine-tuning Mode Detected (No LoRA). Unfreezing LLM...")
-        
-        # 1. 强制解冻 LLM 所有参数
-        # 注意：model.llm 是 FrozenLLM 类，model.llm.model 才是 HF 的 AutoModel
         for param in model.llm.model.parameters():
             param.requires_grad = True
+
+    # ================= [关键修改] 开启梯度检查点 (解决 OOM) =================
+    if hasattr(model.llm.model, "gradient_checkpointing_enable"):
+        model.llm.model.gradient_checkpointing_enable()
+        if rank == 0 and logger:
+            logger.info(">>> Gradient Checkpointing ENABLED. (Memory Efficient Mode)")
+    # ======================================================================
+
     # 4. 冻结策略
     if args.freeze_encoder:
         for p in model.ts_model.shape_encoder.parameters():
@@ -270,7 +282,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         for p in model.ts_model.shape_encoder.parameters():
             p.requires_grad = True
     
-    # 5. DDP
+    # 5. DDP 包装
     if world_size > 1:
         model = DDP(
             model, 
@@ -279,54 +291,60 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
             find_unused_parameters=True
         )
     
-    encoder_params = []
-    other_params = []
+    # 分组参数设置学习率
+    # 分组参数设置学习率
+    ts_params = []  # 整个时序模型 (Low LR)
+    llm_params = [] # LLM & LoRA (High LR)
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "ts_model.shape_encoder" in name or "ts_model.preprocessor" in name or "ts_model.qformer" in name:
-            encoder_params.append(param) # LR = 1e-5
+        
+        # [修改] 只要是 ts_model 下的参数，全部归为低学习率
+        # 这包括了 shape_encoder, detail_encoder(CNN), qformer, adapter, llm_proj, fusion_gate
+        if "ts_model" in name:
+            ts_params.append(param) # LR = 1e-5 (args.lr * 0.1)
         else:
-            # 此时这里只剩下 llm.model (LoRA), detail_proj, film_generator
-            other_params.append(param)   # LR = 1e-4
+            # 剩下的就是 llm.model (LoRA)
+            llm_params.append(param)   # LR = 1e-4 (args.lr)
+
+    optimizer = AdamW([
+        {'params': llm_params, 'lr': args.lr},
+        {'params': ts_params, 'lr': args.lr * 0.1}
+    ], weight_decay=args.weight_decay)
 
     if rank == 0 and logger:
         logger.info(f"-" * 40)
         logger.info(f">>> [Differential LR Strategy Applied]")
-        logger.info(f">>> Encoder Params (LR={args.lr * 0.1:.2e}): {len(encoder_params)} tensors")
-        logger.info(f">>> Other Params   (LR={args.lr:.2e})    : {len(other_params)} tensors")
+        logger.info(f">>> Encoder Params (LR={args.lr * 0.1:.2e}): {len(ts_params)} tensors")
+        logger.info(f">>> Other Params   (LR={args.lr:.2e})    : {len(llm_params)} tensors")
         logger.info(f"-" * 40)
 
     optimizer = AdamW([
-        {'params': other_params, 'lr': args.lr},
-        {'params': encoder_params, 'lr': args.lr * 0.1}
+        {'params': llm_params, 'lr': args.lr},
+        {'params': ts_params, 'lr': args.lr * 0.1}
     ], weight_decay=args.weight_decay)
+    
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     # 6. 数据加载
     paths = args.mix_jsonl_paths.split(',')
     probs = [float(p) for p in args.mix_probs.split(',')]
-    eval_path = args.eval_jsonl_path.strip() # 主要关注的数据集
+    eval_path = args.eval_jsonl_path.strip() 
     
     if rank == 0 and logger:
         logger.info(f">>> [Dynamic Mixing Mode] Loading {len(paths)} datasets...")
-        logger.info(f"    Train Mix Paths: {paths}")
-        logger.info(f"    Eval Split Path: {eval_path}")
         
     sub_datasets = []
     for p in paths:
         p = p.strip()
-        # === 修改点 2: 智能切分逻辑 ===
-        # 只有当路径等于 eval_path 时，才进行 90% 切分，否则 100% 全用
         current_split_ratio = 0.9 if p == eval_path else 1.0
-        
         ds = ChatTSDataset(
             p, 
             args.seq_len, 
             input_channels, 
             split="train", 
-            split_ratio=current_split_ratio, # 动态传入
+            split_ratio=current_split_ratio, 
             patch_stride=args.patch_stride
         )
         sub_datasets.append(ds)
@@ -338,63 +356,123 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         seed=args.seed
     )
     
-    # === 修改点 3: 验证集加载 ===
-    # 强制加载 eval_path 的后 10%
-    if rank == 0 and logger:
-        logger.info(f">>> Loading Validation Set (last 10%) from {eval_path}...")
-
     val_ds = ChatTSDataset(
         eval_path, 
         args.seq_len, 
         input_channels, 
         split="val", 
-        split_ratio=0.9, # 切出后10%
+        split_ratio=0.9, 
         patch_stride=args.patch_stride
     )
+    if rank == 0:
+        logger.info(">>> [Smart Batching] Sorting dataset by length to boost speed...")
+    
+    # 获取所有样本的长度（这里我们以 text 长度近似，或者您如果有 ts 长度更好）
+    # 对于 WeightedMixingDataset，我们需要处理一下子数据集
+    
+    # 简单的策略：不做复杂的 Sampler，直接在 Dataset 层面把数据排好序
+    # 注意：这会轻微破坏随机性（Randomness），但在 SFT 阶段通常是可以接受的，
+    # 或者可以只在每个 Epoch 开始时做 "Chunked Shuffle" (局部乱序)
+    
+    # 这里提供一个最简单有效的补丁：直接对 sub_datasets 内部进行排序
+    if isinstance(train_ds, WeightedMixingDataset):
+        for sub_ds in train_ds.datasets:
+            # 假设 sub_ds.records 是列表
+            if hasattr(sub_ds, 'records'):
+                # 按照 input 文本长度 + 时序长度 进行排序
+                # 这样长数据会聚在一起，极大减少 Padding
+                sub_ds.records.sort(key=lambda x: len(x.get('input', '')) + len(x.get('context', '')))
+    
+    # =========================================================
 
+    # 修改 Sampler：使用 SequentialSampler 或者保持 DistributedSampler 但关闭 shuffle
+    # 为了保持一定的随机性，建议使用 DistributedSampler(shuffle=False) 配合我们刚才的手动排序
+    # 这样每个 GPU 分到的是一段连续的（长度相近的）数据
     
     train_sampler = DistributedSampler(
-        train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed
+        train_ds, num_replicas=world_size, rank=rank, shuffle=False, seed=args.seed
     ) if world_size > 1 else None
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, sampler=train_sampler, shuffle=False, # 注意这里 shuffle=False
+        collate_fn=chatts_collate_fn, num_workers=args.num_workers, pin_memory=True
+    )
+    
+    # train_sampler = DistributedSampler(
+    #     train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed
+    # ) if world_size > 1 else None
     
     val_sampler = DistributedSampler(
         val_ds, num_replicas=world_size, rank=rank, shuffle=False
     ) if world_size > 1 else None
     
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, sampler=train_sampler, shuffle=(train_sampler is None),
-        collate_fn=chatts_collate_fn, num_workers=args.num_workers, pin_memory=True
-    )
+    # train_loader = DataLoader(
+    #     train_ds, batch_size=args.batch_size, sampler=train_sampler, shuffle=(train_sampler is None),
+    #     collate_fn=chatts_collate_fn, num_workers=args.num_workers, pin_memory=True
+    # )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, sampler=val_sampler, shuffle=False,
         collate_fn=chatts_collate_fn, num_workers=args.num_workers, pin_memory=True
     )
     
-    # 1. 计算总优化步数 (Total Training Steps)
+    # Scheduler 配置
     num_update_steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
     max_train_steps = args.epochs * num_update_steps_per_epoch
-    
-    # 2. 计算预热步数
     warmup_steps = int(max_train_steps * 0.05)
     
     if rank == 0:
-        logger.info(f">>> Scheduler: Cosine with Warmup")
         logger.info(f">>> Total Optimization Steps: {max_train_steps}")
-        logger.info(f">>> Warmup Steps: {warmup_steps} (Ratio: 0.05)")
-        eval_steps_interval = int(len(train_loader) * args.eval_interval)
-        logger.info(f">>> Eval Interval: Every {args.eval_interval} epoch (~{eval_steps_interval} steps)")
+        logger.info(f">>> Warmup Steps: {warmup_steps}")
 
-    # 3. 初始化调度器
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=max_train_steps
     )
     
-    # --- 辅助函数：执行评测和保存 ---
-    # [修改点1]: 增加 current_train_loss 参数
+    # ==============================================================================
+    # 辅助函数：执行评测和保存 (In-Process Eval + 分布式同步)
+    # ==============================================================================
     best_val_loss = float("inf")
-    
+    def log_exam_stats(results_list, logger):
+        if not results_list: return
+        
+        from collections import defaultdict
+        total_stats = {"correct": 0, "total": 0}
+        cat_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+        
+        for item in results_list:
+            cat = item.get("category", "Uncategorized")
+            score = item.get("judge_score", 0)
+            total_stats["total"] += 1
+            cat_stats[cat]["total"] += 1
+            if score == 1:
+                total_stats["correct"] += 1
+                cat_stats[cat]["correct"] += 1
+        
+        logger.info(f"\n{'='*25} Regex Judge Report (Epoch {epoch+1} Step {step}) {'='*25}")
+        logger.info(f"{'Category':<35} | {'Acc':<8} | {'Correct':<8} | {'Total':<8}")
+        logger.info("-" * 75)
+        
+        forced_order = ["Pattern Recognition", "Noise Understanding", "Anomaly Detection", "Similarity Analysis", "Causality Analysis"]
+        for cat in forced_order:
+            # 兼容拼写错误
+            target_key = cat if cat in cat_stats else ("Anolmaly Detection" if "Anolmaly Detection" in cat_stats and cat == "Anomaly Detection" else None)
+            if target_key and target_key in cat_stats:
+                s = cat_stats[target_key]
+                acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
+                logger.info(f"{target_key:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
+
+        remaining = sorted([c for c in cat_stats.keys() if c not in forced_order and c != "Anolmaly Detection"])
+        for cat in remaining:
+            s = cat_stats[cat]
+            acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
+            logger.info(f"{cat:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
+
+        logger.info("-" * 75)
+        total_acc = (total_stats['correct'] / total_stats['total']) * 100 if total_stats['total'] > 0 else 0.0
+        logger.info(f"{'OVERALL':<35} | {total_acc:<7.2f}% | {total_stats['correct']:<8} | {total_stats['total']:<8}")
+        logger.info("=" * 75)
     def run_evaluation_pipeline(current_epoch, current_step, current_best_loss, current_train_loss):
         if rank == 0:
             logger.info(f"Step {current_step} [Eval] Computing Validation Loss...")
@@ -402,15 +480,24 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         # 1. 计算 Val Loss
         avg_val_loss = evaluate(model, val_loader, device, rank)
         
+        # 2. 决策：是否是最佳模型 (由 Rank 0 决定)
+        is_best = torch.tensor([0], device=device)
+        new_best_loss = current_best_loss
+        
         if rank == 0:
-            # [修改点2]: 日志输出包含 Train Loss
             logger.info(f"Epoch {current_epoch+1} (Step {current_step}) | Train Loss: {current_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-            
-            # 2. 保存 Best Model
             if avg_val_loss < current_best_loss:
-                logger.info(f">>> Val Loss Improved ({current_best_loss:.4f} -> {avg_val_loss:.4f}). Saving Model...")
+                is_best[0] = 1
                 new_best_loss = avg_val_loss
-                
+                logger.info(f">>> Val Loss Improved ({current_best_loss:.4f} -> {avg_val_loss:.4f}).")
+        
+        # 3. 广播决策 (防止死锁)
+        if world_size > 1:
+            dist.broadcast(is_best, src=0)
+            
+        if is_best.item() == 1:
+            # 3.1 保存模型 (仅 Rank 0)
+            if rank == 0:
                 if args.model_suffix:
                     model_filename = f"sft_{args.model_suffix}.pth"
                 else:
@@ -434,64 +521,67 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
                 
                 logger.info(f">>> Best ChatTS Instruct Model saved to: {save_path}")
 
-                # 3. 自动评测 (test_exam.py)
-                if args.test_exam_path:
-                    logger.info(f">>> [Auto-Eval] Triggering evaluation...")
-                    eval_log_name = f"sft_eval_result_e{current_epoch+1}_s{current_step}_{args.model_suffix}.jsonl"
-                    eval_output_path = project_root / "log" / eval_log_name
-                    
-                    cmd = [
-                        sys.executable, "train/test_exam.py",
-                        "--jsonl-path", args.test_exam_path,
-                        "--checkpoint", str(save_path),
-                        "--output-file", str(eval_output_path),
-                        "--llm-model-path", args.llm_model_path,
-                        "--seq-len", str(args.seq_len),
-                        "--patch-len", str(args.patch_len),
-                        "--patch-stride", str(args.patch_stride),
-                        "--num-gen-samples", str(args.eval_num_samples),
-                    ]
-                    
-                    if args.use_lora:
-                        cmd.extend(["--use-lora", "--lora-r", str(args.lora_r), "--lora-alpha", str(args.lora_alpha)])
-                    
-                    try:
-                        clean_env = os.environ.copy()
-                        for key in ["RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"]:
-                            clean_env.pop(key, None)
-                        
-                        clean_env["CUDA_VISIBLE_DEVICES"] = str(local_rank)
-
-                        result = subprocess.run(cmd, env=clean_env, capture_output=True, text=True)
-                        
-                        if result.returncode == 0:
-                            logger.info("\n" + "="*30 + f" EVAL REPORT (Step {current_step}) " + "="*30)
-                            logger.info(result.stdout)
-                            logger.info("="*80)
-                        else:
-                            logger.error(f">>> [Auto-Eval] Failed. Stderr: {result.stderr}")
-                    except Exception as e:
-                        logger.error(f">>> [Auto-Eval] Exception: {e}")
+            # 3.2 自动评测 (所有 Rank 共同参与)
+            if args.test_exam_path and run_internal_eval is not None:
+                if rank == 0: logger.info(f">>> [Auto-Eval] Triggering in-process evaluation...")
                 
-                return new_best_loss
+                model.eval()
+                
+                # 获取 unwrapped model
+                if isinstance(model, DDP):
+                    tokenizer = model.module.tokenizer.tokenizer
+                    inference_model = model
+                else:
+                    tokenizer = model.tokenizer.tokenizer
+                    inference_model = model
+                
+                class EvalArgs:
+                    pass
+                eval_args = EvalArgs()
+                eval_args.jsonl_path = args.test_exam_path
+                eval_args.output_file = str(project_root / "log" / f"sft_eval_result_e{current_epoch+1}_s{current_step}_{args.model_suffix}.jsonl")
+                eval_args.seq_len = args.seq_len
+                eval_args.patch_len = args.patch_len
+                eval_args.patch_stride = args.patch_stride
+                eval_args.enable_cot = False
+                eval_args.mask_query = False
+                eval_args.mask_detail = False
+                eval_args.mask_text_stats = False
+                
+                try:
+                    torch.cuda.empty_cache()
+                    with torch.no_grad():
+                        # 获取评测结果列表
+                        final_results = run_internal_eval(
+                            model=inference_model, tokenizer=tokenizer, args=eval_args,
+                            device=device, rank=rank, world_size=world_size
+                        )
+                    
+                    # [关键修改] Rank 0 负责将统计结果写入 Logger
+                    if rank == 0:
+                        log_exam_stats(final_results, logger)
+                        logger.info(f">>> [Auto-Eval] Finished.")
+                        
+                except Exception as e:
+                    if rank == 0:
+                        logger.error(f">>> [Auto-Eval] Exception: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                model.train()
+                torch.cuda.empty_cache()
+        
+        # 同步 Best Loss
+        if world_size > 1:
+            loss_tensor = torch.tensor([new_best_loss], device=device)
+            dist.broadcast(loss_tensor, src=0)
+            new_best_loss = loss_tensor.item()
             
-        return current_best_loss
+        return new_best_loss
 
     # 7. 训练循环
     accumulation_steps = args.gradient_accumulation_steps
-    current_grad_norm = 0.0
-    
-    # eval_steps_interval = int(len(train_loader) * args.eval_interval)
-    # if eval_steps_interval <= 0: eval_steps_interval = len(train_loader)
-    num_updates_per_epoch = len(train_loader) // accumulation_steps
-    
-    # 2. 计算每多少次更新评测一次
-    eval_updates_interval = int(num_updates_per_epoch * args.eval_interval)
-    if eval_updates_interval < 1: 
-        eval_updates_interval = 1
-        
-    # 3. 换算回 Dataloader 的 Step 数
-    eval_steps_interval = eval_updates_interval * accumulation_steps
+    eval_interval_steps = max(1, int(len(train_loader) // accumulation_steps * args.eval_interval)) * accumulation_steps
 
     for epoch in range(args.epochs):
         if train_sampler is not None:
@@ -503,7 +593,7 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         train_loss_sum = 0
         
         if rank == 0:
-            progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Instruct-LoRA]")
+            progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         else:
             progress = train_loader
         
@@ -523,29 +613,18 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
             train_loss_sum += loss.item() * accumulation_steps
             
             if (step + 1) % accumulation_steps == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-                if isinstance(grad_norm, torch.Tensor):
-                    current_grad_norm = grad_norm.item()
-                else:
-                    current_grad_norm = grad_norm
-                
-                if math.isnan(current_grad_norm) or math.isinf(current_grad_norm):
-                    if rank == 0:
-                        logger.warning(f"!!! NaN/Inf Gradient (norm={current_grad_norm}) at Step {step}.")
-                    optimizer.zero_grad()
-                else:
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
             
             if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
-                progress.set_postfix(loss=loss.item() * accumulation_steps, lr=f"{current_lr:.2e}", gn=f"{current_grad_norm:.2f}")
+                progress.set_postfix(loss=loss.item() * accumulation_steps, lr=f"{current_lr:.2e}")
             
-            # --- 评测逻辑修正 ---
+            # --- 步骤内评测 ---
             if (step + 1) % accumulation_steps == 0:
-                if ((step + 1) % eval_steps_interval == 0) and ((step + 1) != len(train_loader)):
-                    # [修改点3]: 计算 avg_train_loss 并传入
+                if ((step + 1) % eval_interval_steps == 0) and ((step + 1) != len(train_loader)):
                     avg_train_loss = train_loss_sum / (step + 1)
                     best_val_loss = run_evaluation_pipeline(epoch, step + 1, best_val_loss, avg_train_loss)
                     model.train()
@@ -559,7 +638,6 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
         if dist.is_initialized():
             dist.barrier()
             
-        # [修改点3]: 计算全 Epoch 的 avg_train_loss 并传入
         avg_train_loss = train_loss_sum / len(train_loader)
         best_val_loss = run_evaluation_pipeline(epoch, len(train_loader), best_val_loss, avg_train_loss)
         
@@ -567,24 +645,17 @@ def train_chatts_instruct_ddp(args, rank, world_size, local_rank):
 
     if rank == 0 and logger:
         logger.info(">>> ChatTS Instruction Tuning Completed!")
-
 def main():
     parser = argparse.ArgumentParser(description="ChatTS 格式数据 - Stage 3 多卡指令微调 (支持 LoRA)")
     
-    # === 修改点 1: 参数调整 ===
-    # 移除了 jsonl-path, 增加了 test-exam-path
     parser.add_argument("--mix-jsonl-paths", type=str, required=True, help="逗号分隔的多个训练数据路径")
     parser.add_argument("--mix-probs", type=str, required=True, help="逗号分隔的混合概率")
     parser.add_argument("--eval-jsonl-path", type=str, required=True, help="用于验证 Loss 的数据集路径 (切分10%)")
+    parser.add_argument("--test-exam-path", type=str, default="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.json", help="[可选] 自动评测脚本用的测试集路径")
     
-    # 重命名原有的自动评测路径参数，避免混淆
-    parser.add_argument("--test-exam-path", type=str, default="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.json", help="[可选] 自动评测脚本(test_exam.py)用的测试集路径")
-    
-    # 其他参数...
     parser.add_argument("--eval-num-samples", type=int, default=746)
     parser.add_argument("--eval-interval", type=float, default=1.0)
     parser.add_argument("--stage2-checkpoint", type=str, default="model/chatts_stage2_aligned.pth")
-    # ... (其余参数保持不变) ...
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--patch-len", type=int, default=16)
@@ -604,7 +675,7 @@ def main():
     parser.add_argument("--lora-dropout", type=float, default=0.1)
     parser.add_argument("--save-only-trainable", action="store_true")
     parser.add_argument("--proj-dropout", type=float, default=0.05, 
-                        help="Dropout rate for MLP projectors (DetailProj & LLMProj).")
+                        help="Dropout rate for MLP projectors.")
     
     args = parser.parse_args()
     

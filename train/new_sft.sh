@@ -27,9 +27,12 @@ TEST_EXAM_DATA="/mnt/shared-storage-user/huaermo/code/test_wbt2/convert.jsonl"
 # 混合配置
 MIX_PATHS="$SFT_DATA,$IFT_DATA,$ALIGN_DATA"
 MIX_PROBS="0.4,0.3,0.3"
-
-# 代码将从 SFT_DATA 切出 10% 做 Loss 验证，IFT 和 ALIGN 将 100% 参与训练
 EVAL_DATA="$SFT_DATA"
+# MIX_PATHS="$IFT_DATA"
+# MIX_PROBS="1.0"
+# EVAL_DATA="$IFT_DATA"
+# 代码将从 SFT_DATA 切出 10% 做 Loss 验证，IFT 和 ALIGN 将 100% 参与训练
+
 
 # 训练超参数
 BATCH_SIZE=1
@@ -40,6 +43,7 @@ SEQ_LEN=2048
 PATCH_LEN=16
 PATCH_STRIDE=8
 INTERVAL=0.25
+WEIGHT_DECAY=0.01
 
 echo "=========================================="
 echo " ChatTS sft "
@@ -63,6 +67,7 @@ CMD="torchrun --nproc_per_node=$NUM_GPUS \
     --epochs $EPOCHS \
     --num-workers 16 \
     --save-only-trainable \
+    --weight-decay $WEIGHT_DECAY \
     --seed 42 \
     --use-lora \
     --lora-r 128 \

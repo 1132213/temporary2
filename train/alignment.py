@@ -32,7 +32,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 import logging
-from datetime import datetime
+from datetime import datetime,timedelta
 import math
 import subprocess
 from transformers import get_cosine_schedule_with_warmup
@@ -54,7 +54,8 @@ def setup_distributed():
             backend='nccl',
             init_method='env://',
             world_size=world_size,
-            rank=rank
+            rank=rank,
+            timeout=timedelta(minutes=60)
         )
         torch.cuda.set_device(local_rank)
     
