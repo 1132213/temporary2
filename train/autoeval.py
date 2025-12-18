@@ -82,13 +82,12 @@ def extract_answer_option(text):
     return "None"
 
 def evaluate_exam_results_with_regex(results_list):
-    """统计并打印结果"""
     total_stats = {"correct": 0, "total": 0}
     cat_stats = defaultdict(lambda: {"correct": 0, "total": 0})
     none_indices = []
     
-    # 统计逻辑
-    for i, item in enumerate(results_list):
+    print(f"\n>>> Starting Regex Evaluation on {len(results_list)} samples...")
+    for i, item in enumerate(tqdm(results_list, desc="Regex Judging")):
         gt = item.get("ground_truth", "").strip()
         pred = item.get("prediction", "").strip()
         cat = item.get("category", "Uncategorized")
@@ -97,33 +96,41 @@ def evaluate_exam_results_with_regex(results_list):
         pred_opt = extract_answer_option(pred)
         
         if pred_opt == "None":
-            # 优先使用 id，如果没有则用索引
-            none_indices.append(item.get("id", i))
+            record_id = item.get("id", i) 
+            none_indices.append(record_id)
         
         is_correct_val = 1 if (gt_opt != "None" and gt_opt == pred_opt) else 0
         
         item["judge_score"] = is_correct_val
+        item["judge_type"] = "regex"
+        
         total_stats["total"] += 1
         cat_stats[cat]["total"] += 1
         if is_correct_val == 1:
             total_stats["correct"] += 1
             cat_stats[cat]["correct"] += 1
 
-    # 打印报表
     print(f"\n{'='*25} Regex Judge Report {'='*25}")
     print(f"{'Category':<35} | {'Acc':<8} | {'Correct':<8} | {'Total':<8}")
     print("-" * 75)
+
+    forced_order = [
+        "Pattern Recognition", "Noise Understanding", "Anomaly Detection", 
+        "Similarity Analysis", "Causality Analysis"
+    ]
     
-    forced_order = ["Pattern Recognition", "Noise Understanding", "Anomaly Detection", "Similarity Analysis", "Causality Analysis"]
     for cat in forced_order:
-        target_key = cat if cat in cat_stats else ("Anolmaly Detection" if "Anolmaly Detection" in cat_stats and cat == "Anomaly Detection" else None)
-        if target_key and target_key in cat_stats:
+        target_key = cat
+        if cat not in cat_stats and "Anolmaly Detection" in cat_stats and cat == "Anomaly Detection":
+            target_key = "Anolmaly Detection"
+
+        if target_key in cat_stats:
             s = cat_stats[target_key]
             acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
             print(f"{target_key:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
-
-    remaining = sorted([c for c in cat_stats.keys() if c not in forced_order and c != "Anolmaly Detection"])
-    for cat in remaining:
+    
+    remaining_cats = sorted([c for c in cat_stats.keys() if c not in forced_order and c != "Anolmaly Detection"])
+    for cat in remaining_cats:
         s = cat_stats[cat]
         acc = (s['correct'] / s['total']) * 100 if s['total'] > 0 else 0.0
         print(f"{cat:<35} | {acc:<7.2f}% | {s['correct']:<8} | {s['total']:<8}")
@@ -131,8 +138,9 @@ def evaluate_exam_results_with_regex(results_list):
     print("-" * 75)
     total_acc = (total_stats['correct'] / total_stats['total']) * 100 if total_stats['total'] > 0 else 0.0
     print(f"{'OVERALL':<35} | {total_acc:<7.2f}% | {total_stats['correct']:<8} | {total_stats['total']:<8}")
-    print("=" * 75)
-    
+    print("-" * 75)
+    print(f"Failed Extraction (None) Count : {len(none_indices)}")
+    print("=" * 75 + "\n")
     return results_list
 
 def run_internal_eval(model, tokenizer, args, device, rank, world_size):
